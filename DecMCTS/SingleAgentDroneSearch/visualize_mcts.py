@@ -5,7 +5,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import matplotlib.pyplot as plt
 import numpy as np
 from gridworld import GridWorldState
-from decmcts import MCTS
+from mcts import MCTS
 
 def get_best_action(mcts):
     best_action = None

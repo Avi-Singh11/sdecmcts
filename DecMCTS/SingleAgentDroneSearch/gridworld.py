@@ -3,7 +3,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import random
-from decmcts import MCTS
+from mcts import MCTS
 
 class GridWorldState:
     def __init__(self, agent_pos, goal_pos, grid_size, reward=0, is_terminal=None):

@@ -3,7 +3,7 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from game2048 import Game2048State
-from decmcts import MCTS
+from mcts import MCTS
 
 def get_best_action(mcts):
     best_action = None
