@@ -19,19 +19,28 @@ class GridWorldState:
             actions.append("left")
         if self.agent_pos[1] < self.grid_size[1] - 1:
             actions.append("right")
+        
         return actions
 
     # TODO: EMBED UNCERTAINTIES INTO ACTIONS: STAY WITH PROB 0.8, MOVE WITH PROB 0.1, ETC.
     def take_action(self, action):
-        if action == "up":
+        
+        actual_action = action
+        if action != "stay":
+            # Example probability threshold based on your comment
+            # (chance to actually move vs. chance to slip and stay)
+            if random.random() > 0.8:
+                actual_action = "stay"
+
+        if actual_action == "up":
             new_agent_pos = (self.agent_pos[0] - 1, self.agent_pos[1])
-        elif action == "down":
+        elif actual_action == "down":
             new_agent_pos = (self.agent_pos[0] + 1, self.agent_pos[1])
-        elif action == "left":
+        elif actual_action == "left":
             new_agent_pos = (self.agent_pos[0], self.agent_pos[1] - 1)
-        elif action == "right":
+        elif actual_action == "right":
             new_agent_pos = (self.agent_pos[0], self.agent_pos[1] + 1)
-        elif action == "stay":
+        elif actual_action == "stay":
             new_agent_pos = self.agent_pos
         
         is_term = (new_agent_pos == self.goal_pos)

@@ -15,6 +15,15 @@ class MCTSNode:
         child = MCTSNode(child_state, parent=self, action=action)
         self.children.append(child)
         return child
+        
+    def compute_q(self):
+        if self.visits == 0:
+            return 0
+        else:
+            return self.cum_reward / self.visits
+
+    def is_fully_expanded(self):
+        return len(self.children) == len(self.state.get_legal_actions())
     
 
 class MCTS:
@@ -30,7 +39,7 @@ class MCTS:
     def selection(self):
         current_node = self.root
 
-        while current_node.children:
+        while current_node.is_fully_expanded() and not current_node.state.is_terminal_state():
             best_score = -float('inf')
             best_child = None
 
@@ -46,6 +55,9 @@ class MCTS:
 
     # EXPANSION
     def expansion(self, node):
+        if node.state.is_terminal_state():
+            return node
+            
         legal_actions = node.state.get_legal_actions()
         tried_actions = [child.action for child in node.children]
         untried_actions = [action for action in legal_actions if action not in tried_actions]
@@ -72,30 +84,25 @@ class MCTS:
                 
             action = random.choice(legal_actions)
             current_state = current_state.take_action(action)
-            total_rollout_reward += current_state.reward
+            total_rollout_reward += current_state.reward * (self.discount_factor ** depth)
             depth += 1
             
         return total_rollout_reward
 
     # BACKPROPAGATION
-    def backprop(self, node, discount_factor):
+    def backprop(self, node, rollout_reward):
+        future_return = rollout_reward
         while node is not None:
-            q_val = node.compute_q()
             node.visits += 1
-            reward = node.state.reward * discount_factor
-            node.cum_reward += reward
+            total_return = node.state.reward + self.discount_factor * future_return
+            node.cum_reward += total_return
+            
+            future_return = total_return
             node = node.parent
-        
-        return q_val
         
     # UCB SCORE
     def ucb_score(self, node):
         return node.compute_q() + self.exploration_const * math.sqrt(math.log(self.root.visits) / node.visits)
 
-    def compute_q(self):
-        if self.visits == 0:
-            return 0
-        else:
-            return self.cum_reward / self.visits
     
 
