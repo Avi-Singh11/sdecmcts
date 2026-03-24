@@ -26,13 +26,10 @@ class GridWorldState:
         
         return actions
 
-    # TODO: EMBED UNCERTAINTIES INTO ACTIONS: STAY WITH PROB 0.8, MOVE WITH PROB 0.1, ETC.
     def take_action(self, action):
         
         actual_action = action
         if action != "stay":
-            # Example probability threshold based on your comment
-            # (chance to actually move vs. chance to slip and stay)
             if random.random() > 0.8:
                 actual_action = "stay"
 

@@ -23,7 +23,7 @@ class DecMCTSNode:
             
         self.untried_actions = None
         if state is not None and not state.is_terminal_state():
-            self.untried_actions = state.get_legal_actions()
+            self.untried_actions = list(state.get_legal_actions())
         else:
             self.untried_actions = []
 
@@ -107,7 +107,7 @@ class DecMCTS:
         self.local_X = [] # List of top action sequence tuples
         self.local_dist = {} # dict mapping action_seq_tuple -> prob
         
-        # Track best complete rollout sequences for sample space extraction
+        # Track best complete rollout sequences for sample space extraction; dynamic caching
         self.best_rollouts = []
 
     def sample_seq(self, dist_dict):
@@ -149,7 +149,7 @@ class DecMCTS:
                 node = node.add_child(action, next_state)
                 
             # Rollout
-            curr_state = node.state
+            curr_state = copy.deepcopy(node.state)
             rollout_actions = []
             depth = 0
             while not curr_state.is_terminal_state() and len(node.action_sequence) + depth < self.depth:
@@ -204,8 +204,6 @@ class DecMCTS:
             self.local_dist = {s: prob for s in self.local_X}
         else:
             self.local_dist = {}
-        
-        self.beta = self.initial_beta
 
     def update_distribution(self):
         if not self.local_X:
@@ -248,7 +246,7 @@ class DecMCTS:
                 
             # Gradient descent step
             update_delta = self.alpha * q_val * (
-                (expected_f_r - expected_f_r_given_xr) / self.beta + entropy + ln_q
+                (expected_f_r_given_xr - expected_f_r) / self.beta + entropy + ln_q
             )
             
             new_val = q_val - update_delta
