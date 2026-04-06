@@ -40,6 +40,9 @@ class MCTS:
         current_node = self.root
 
         while current_node.is_fully_expanded() and not current_node.state.is_terminal_state():
+            if not current_node.children:  # Safety check
+                break
+                
             best_score = -float('inf')
             best_child = None
 
@@ -49,6 +52,8 @@ class MCTS:
                     best_score = curr_score
                     best_child = child
             
+            if best_child is None:
+                break
             current_node = best_child
 
         return current_node
@@ -66,16 +71,14 @@ class MCTS:
             action = random.choice(untried_actions)
             next_state = node.state.take_action(action)
             return node.add_child(next_state, action)
-        else:
-            return None
-
-        return node
+        
+        return node  # Fully expanded
 
     # ROLLOUT
     def rollout(self, node):
         current_state = node.state
         total_rollout_reward = 0
-        depth = 0
+        depth = 1
         
         while not current_state.is_terminal_state() and depth < self.depth:
             legal_actions = current_state.get_legal_actions()
@@ -91,18 +94,42 @@ class MCTS:
 
     # BACKPROPAGATION
     def backprop(self, node, rollout_reward):
-        future_return = rollout_reward
+        current_reward = rollout_reward
         while node is not None:
             node.visits += 1
-            total_return = node.state.reward + self.discount_factor * future_return
-            node.cum_reward += total_return
-            
-            future_return = total_return
+            current_reward = node.state.reward + self.discount_factor * current_reward
+            node.cum_reward += current_reward
             node = node.parent
         
     # UCB SCORE
     def ucb_score(self, node):
-        return node.compute_q() + self.exploration_const * math.sqrt(math.log(self.root.visits) / node.visits)
-
+        if node.visits == 0:
+            return float('inf')  # Prioritize unvisited nodes
+        return node.compute_q() + self.exploration_const * math.sqrt(
+            math.log(node.parent.visits) / node.visits
+        )
     
-
+    # MAIN SEARCH
+    def search(self):
+        for _ in range(self.num_iter):
+            # Selection
+            node = self.selection()
+            
+            # Expansion
+            node = self.expansion(node)
+            
+            # Rollout
+            reward = self.rollout(node)
+            
+            # Backpropagation
+            self.backprop(node, reward)
+        
+        # Return best action
+        return self.get_best_action()
+    
+    # GET BEST ACTION
+    def get_best_action(self):
+        if not self.root.children:
+            return None
+        best_child = max(self.root.children, key=lambda c: c.visits)
+        return best_child.action
