@@ -29,10 +29,13 @@ import sys
 import argparse
 from collections import defaultdict
 
+import json
+import datetime
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from decmcts import DecMCTS, DecMCTSTeam
+from cenmcts import CenMCTS, CenMCTSNode
 
 # CONFIGURATION
 
@@ -41,7 +44,7 @@ SEED          = 42
 # Graph
 N_VERTICES    = 4000         
 WORLD_SIZE    = 100.0        
-N_neighborS  = 8            # k-NN connectivity (PRM-like)
+N_NEIGHBORS  = 8            # k-NN connectivity (PRM-like)
 N_OBSTACLES   = 5            
 
 # Regions
@@ -62,6 +65,12 @@ CP            = 1.0 / math.sqrt(2)
 ALPHA         = 0.01
 BETA_INIT     = 1.0
 BETA_DECAY    = 0.99
+
+# Communication interval: broadcast every COMM_PERIOD outer iterations
+# 1  = every iteration (maximum bandwidth, paper default)
+# K  = every K iterations
+# -1 = never communicate (fully decentralized baseline)
+COMM_PERIOD   = 1
 
 # Robustness sweep: message drop probabilities to evaluate
 DROP_PROBS    = [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -265,140 +274,9 @@ def actions_to_path(start_vertex, action_sequence):
     """
     return [start_vertex] + list(action_sequence)
 
-
-# CENTRALIZED MCTS BASELINE
-
-class CenMCTSNode:
-    """Node in the joint centralized tree. Tracks which robot moves next."""
-
-    def __init__(self, states, robot_paths, turn, parent=None, action=None):
-        self.states      = states       # {rid: OrienteeringState}
-        self.robot_paths = robot_paths  # {rid: [vertex, ...]}
-        self.turn        = turn         # which robot acts next
-        self.parent      = parent
-        self.action      = action
-        self.children    = []
-        self.visits      = 0
-        self.cum_reward  = 0.0
-
-    def is_terminal(self):
-        return all(s.is_terminal_state() for s in self.states.values())
-
-    def is_fully_expanded(self):
-        return len(self.children) == len(self.states[self.turn].get_legal_actions())
-
-    def q(self):
-        return self.cum_reward / self.visits if self.visits else 0.0
-
-
-class CenMCTS:
-    """
-    Centralized MCTS baseline: single joint tree interleaving robot actions.
-    Robot turns cycle 0, 1, ..., R-1, 0, 1, ... until all budgets exhausted.
-    Upper bound reference for Dec-MCTS quality comparison.
-    """
-
-    def __init__(self, init_states, global_obj, starts,
-                 exploration_const=math.sqrt(2), rollout_depth=50):
-        robot_paths = {rid: [s.vertex] for rid, s in init_states.items()}
-        self.root         = CenMCTSNode(init_states, robot_paths, turn=0)
-        self.robot_ids    = sorted(init_states.keys())
-        self.global_obj   = global_obj
-        self.starts       = starts
-        self.Cp           = exploration_const
-        self.rollout_depth = rollout_depth
-
-    def run(self, n_iter):
-        for _ in range(n_iter):
-            node   = self._select(self.root)
-            child  = self._expand(node)
-            reward = self._rollout(child)
-            self._backprop(child, reward)
-        return self._best_paths()
-
-    def _select(self, node):
-        while not node.is_terminal() and node.is_fully_expanded():
-            if not node.children:
-                break
-            node = max(node.children, key=lambda c: (
-                c.q() + self.Cp * math.sqrt(math.log(node.visits) / c.visits)
-                if c.visits > 0 else float('inf')
-            ))
-        return node
-
-    def _expand(self, node):
-        if node.is_terminal():
-            return node
-        legal = node.states[node.turn].get_legal_actions()
-        tried = {c.action for c in node.children}
-        untried = [a for a in legal if a not in tried]
-        if not untried:
-            return node
-        action = random.choice(untried)
-
-        new_states = dict(node.states)
-        new_states[node.turn] = node.states[node.turn].take_action(action)
-
-        new_paths = dict(node.robot_paths)
-        new_paths[node.turn] = node.robot_paths[node.turn] + [action]
-
-        # Advance turn (skip robots that are terminal)
-        R = len(self.robot_ids)
-        next_turn = node.turn
-        for _ in range(R):
-            next_turn = (next_turn + 1) % R
-            if not new_states[self.robot_ids[next_turn]].is_terminal_state():
-                break
-        next_robot = self.robot_ids[next_turn]
-
-        child = CenMCTSNode(new_states, new_paths, next_robot,
-                            parent=node, action=action)
-        node.children.append(child)
-        return child
-
-    def _rollout(self, node):
-        states = dict(node.states)
-        paths  = dict(node.robot_paths)
-        turn_idx = self.robot_ids.index(node.turn)
-        depth = 0
-        while depth < self.rollout_depth:
-            active = [r for r in self.robot_ids
-                      if not states[r].is_terminal_state()]
-            if not active:
-                break
-            rid = active[turn_idx % len(active)]
-            legal = states[rid].get_legal_actions()
-            if not legal:
-                turn_idx += 1
-                depth += 1
-                continue
-            a = random.choice(legal)
-            states[rid] = states[rid].take_action(a)
-            paths[rid]  = paths[rid] + [a]
-            turn_idx += 1
-            depth += 1
-        return self.global_obj(paths)
-
-    def _backprop(self, node, reward):
-        while node is not None:
-            node.visits     += 1
-            node.cum_reward += reward
-            node = node.parent
-
-    def _best_paths(self):
-        """Greedy descent by Q-value to extract best joint plan."""
-        node = self.root
-        while node.children:
-            visited = [c for c in node.children if c.visits > 0]
-            if not visited:
-                break
-            node = max(visited, key=lambda c: c.q())
-        return node.robot_paths
-
-
 # SINGLE TRIAL
 
-def run_trial(seed, n_outer, drop_prob=0.0, verbose=True):
+def run_trial(seed, n_outer, drop_prob=0.0, comm_period=COMM_PERIOD, verbose=True):
     """
     Run one problem instance. Returns dict of metrics.
 
@@ -410,7 +288,7 @@ def run_trial(seed, n_outer, drop_prob=0.0, verbose=True):
 
     # Build environment 
     obstacles = build_obstacles(rng, WORLD_SIZE, N_OBSTACLES)
-    graph     = Graph(N_VERTICES, WORLD_SIZE, N_neighborS, obstacles, rng)
+    graph     = Graph(N_VERTICES, WORLD_SIZE, N_NEIGHBORS, obstacles, rng)
     regions   = build_regions(rng, WORLD_SIZE, N_REGIONS, REGION_RADIUS)
     assign_vertices_to_regions(graph, regions)
 
@@ -533,12 +411,13 @@ def run_trial(seed, n_outer, drop_prob=0.0, verbose=True):
         for rid in robot_ids:
             planners[rid].iterate(n_outer=1)
 
-        # Communicate with message dropping
-        for rid in robot_ids:
-            X_hat, q = planners[rid].get_distribution()
-            for other in robot_ids:
-                if other != rid and rng.random() > drop_prob:
-                    planners[other].receive_dist_dict(rid, q)
+        # Communicate with message dropping (gated by comm_period)
+        if comm_period > 0 and n % comm_period == 0:
+            for rid in robot_ids:
+                _, q = planners[rid].get_distribution()
+                for other in robot_ids:
+                    if other != rid and rng.random() > drop_prob:
+                        planners[other].receive_dist_dict(rid, q)
 
         # Extract current joint plan
         seqs = {rid: planners[rid].best_action_sequence() for rid in robot_ids}
@@ -689,10 +568,13 @@ def main():
                         help="Number of random problem instances to average over")
     parser.add_argument("--robustness", action="store_true",
                         help="Run the message-drop robustness sweep")
-    parser.add_argument("--outer",    type=int, default=N_OUTER)
+    parser.add_argument("--outer",       type=int, default=N_OUTER)
+    parser.add_argument("--comm-period", type=int, default=COMM_PERIOD,
+                        help="Broadcast every K outer iterations; -1 = never")
     args = parser.parse_args()
 
-    n_outer = args.outer
+    n_outer     = args.outer
+    comm_period = args.comm_period
 
     section("EXPERIMENT CONFIG")
     print(f"  Graph vertices  : {N_VERTICES}")
@@ -700,6 +582,7 @@ def main():
     print(f"  Robots          : {N_ROBOTS}")
     print(f"  Budget          : {BUDGET:.0f}  (distance units)")
     print(f"  Outer iters     : {n_outer}  (τ={TAU} rollouts each)")
+    print(f"  Comm period     : {comm_period}  ({'every iter' if comm_period == 1 else 'never' if comm_period < 0 else f'every {comm_period} iters'})")
     print(f"  Trials          : {args.trials}")
     print(f"  Total rollouts/robot: {n_outer * TAU}")
     print()
@@ -719,6 +602,7 @@ def main():
         if args.trials > 1:
             sub(f"Trial {trial+1}/{args.trials}  (seed={seed})")
         result = run_trial(seed, n_outer, drop_prob=0.0,
+                           comm_period=comm_period,
                            verbose=(args.trials == 1))
         all_results.append(result)
 
@@ -827,6 +711,114 @@ def main():
         bar = "█" * bl + "░" * (bar_w - bl)
         col = G if rv == max_r else RST
         print(f"  {i+1:>5}  {col}{rv:>8.2f}{RST}  {bar}")
+
+    # ══════════════════════════════════════════════════════════
+    section("EXPORT")
+    # ══════════════════════════════════════════════════════════
+
+    # Compute derived values needed for export
+    def _tree_size(node):
+        return 1 + sum(_tree_size(c) for c in node.children)
+
+    def _entropy(q):
+        return -sum(p * math.log(p) for p in q.values() if p > 0)
+
+    H_max          = math.log(NUM_SEQ) if NUM_SEQ > 1 else 1.0
+    dec_beats_cen  = sum(d > c for d, c in zip(dec_rewards, cen_rewards))
+    last_r         = all_results[-1]
+    last_pls       = last_r["planners"]
+    exp_curve      = last_r["reward_curve"]
+    exp_mid        = len(exp_curve) // 2
+    exp_fh         = avg(exp_curve[:exp_mid]) if exp_mid > 0 else 0
+    exp_sh         = avg(exp_curve[exp_mid:]) if exp_mid < len(exp_curve) else 0
+    first_reward   = exp_curve[0]  if exp_curve else 0
+    final_reward   = exp_curve[-1] if exp_curve else 0
+    reward_pct_gain = ((final_reward - first_reward) / first_reward * 100
+                       if first_reward > 0 else 0.0)
+
+    per_robot_export = {}
+    for rid in range(N_ROBOTS):
+        p  = last_pls[rid]
+        per_robot_export[str(rid)] = {
+            "marginal_contribution": last_r["marginals"].get(rid, 0.0),
+            "entropy_final":         _entropy(p.q) if p.q else H_max,
+            "sharpness":             1.0 - (_entropy(p.q) / H_max if p.q else 1.0),
+            "beta_final":            p.beta,
+            "tree_nodes":            _tree_size(p.root),
+            "seq_len":               len(p.best_action_sequence()),
+            "dist_normalized":       abs(sum(p.q.values()) - 1.0) < 1e-6 if p.q else True,
+        }
+
+    timestamp   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    import os
+    os.makedirs("results", exist_ok=True)
+    export_path = os.path.join("results", f"decmcts_results_{timestamp}.json")
+
+    export = {
+        "meta": {
+            "timestamp": timestamp,
+            "paper":     "Best et al. 2019, Dec-MCTS, IJRR 38(2-3)",
+        },
+        "config": {
+            "N_VERTICES":    N_VERTICES,
+            "N_REGIONS":     N_REGIONS,
+            "N_ROBOTS":      N_ROBOTS,
+            "N_OBSTACLES":   N_OBSTACLES,
+            "N_NEIGHBORS":   N_NEIGHBORS,
+            "WORLD_SIZE":    WORLD_SIZE,
+            "BUDGET":        BUDGET,
+            "REGION_RADIUS": REGION_RADIUS,
+            "TAU":           TAU,
+            "NUM_SEQ":       NUM_SEQ,
+            "NUM_SAMPLES":   NUM_SAMPLES,
+            "GAMMA":         GAMMA,
+            "CP":            CP,
+            "ALPHA":         ALPHA,
+            "BETA_INIT":     BETA_INIT,
+            "BETA_DECAY":    BETA_DECAY,
+            "N_OUTER":       n_outer,
+            "SEED":          SEED,
+        },
+        "paper_comparison": {
+            "dec_pct_of_max":               avg(dec_pcts),
+            "dec_pct_of_max_paper":         65.0,
+            "dec_vs_cen_median_pct":        med(vs_cen_pcts),
+            "dec_vs_cen_median_pct_paper":  7.0,
+            "dec_beats_cen_fraction":       dec_beats_cen / len(all_results),
+            "dec_beats_cen_fraction_paper": 0.91,
+            "dec_regions_found_avg":        avg([r2["dec_regions_found"] for r2 in all_results]),
+            "dec_regions_found_paper":      120,
+            "n_regions_total":              last_r["n_regions"],
+            "dec_reward_median":            med(dec_rewards),
+            "cen_reward_median":            med(cen_rewards),
+        },
+        "correctness_checks": {
+            "paths_graph_connected":   last_r["paths_valid"],
+            "budget_respected":        last_r["budget_respected"],
+            "marginals_sum_leq_joint": last_r["marginals_sum_ok"],
+            "distributions_sum_to_1":  last_r["dist_normalized"],
+            "reward_gt_0":             last_r["dec_reward"] > 0,
+            "reward_improves":         exp_sh >= exp_fh - 0.5,
+        },
+        "per_robot_diagnostics": per_robot_export,
+        "convergence": {
+            "reward_curve":     exp_curve,
+            "reward_iter_1":    first_reward,
+            "reward_final":     final_reward,
+            "reward_pct_gain":  reward_pct_gain,
+            "first_half_avg":   exp_fh,
+            "second_half_avg":  exp_sh,
+            "total_reward_max": last_r["total_reward"],
+        },
+        "timing": {
+            "dec_elapsed_s": avg([r2["dec_elapsed_s"] for r2 in all_results]),
+            "cen_elapsed_s": avg([r2["cen_elapsed_s"] for r2 in all_results]),
+        },
+    }
+
+    with open(export_path, "w") as f:
+        json.dump(export, f, indent=2)
+    print(f"\n  Results saved to: {export_path}\n")
 
     # ══════════════════════════════════════════════════════════
     if args.robustness:

@@ -94,11 +94,19 @@ class MCTS:
 
     # BACKPROPAGATION
     def backprop(self, node, rollout_reward):
+        # rollout() returns sum(r_i * gamma^i) for i >= 1, so it already
+        # represents discounted future reward starting one step after the leaf.
+        # V(node) = node.reward + future_reward
+        # V(parent) = parent.reward + gamma * V(node)
+        # The variable `current_reward` carries the *undiscounted* future value
+        # that the current node adds on top of its own reward, so the parent
+        # sees gamma * V(node) as its future component.
         current_reward = rollout_reward
         while node is not None:
             node.visits += 1
-            current_reward = node.state.reward + self.discount_factor * current_reward
-            node.cum_reward += current_reward
+            node_value = node.state.reward + current_reward
+            node.cum_reward += node_value
+            current_reward = self.discount_factor * node_value
             node = node.parent
         
     # UCB SCORE

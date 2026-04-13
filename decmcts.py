@@ -2,7 +2,7 @@
 decmcts.py
 ----------
 Dec-MCTS implementation:
-Builds on the single-agent MCTS base in mcts.py.
+Builds on the single-agent MCTS base in Scripts/mcts.py.
 
 Your state object must implement:
     state.get_legal_actions()  -> list of actions
@@ -62,7 +62,7 @@ class DecMCTSNode:
             else []
         )
 
-    # ── Tree structure ───────────────────────────────────────
+    # Tree structure
 
     def is_fully_expanded(self):
         return len(self.untried_actions) == 0
@@ -77,7 +77,7 @@ class DecMCTSNode:
             self.untried_actions.remove(action)
         return child
 
-    # ── Q-value accessors ───────────────────────────────────
+    # Q-value accessors
 
     def disc_q(self):
         """Discounted empirical average F̄ (Equation 6)."""
@@ -87,7 +87,7 @@ class DecMCTSNode:
         """Undiscounted Q — used for final greedy extraction (more stable)."""
         return self.cum_reward / self.visits if self.visits > 0 else 0.0
 
-    # ── D-UCT upper confidence bound ────────────────────────
+    # D-UCT upper confidence bound
 
     def d_ucb(self, parent, t, gamma, Cp):
         """
@@ -134,7 +134,7 @@ class DecMCTS:
     local_utility_fn : f^r(joint_sequences) -> float
                        joint_sequences = {robot_id: [action, ...], ...}
                        Should implement Equation 1:
-                           g(x^r ∪ x^(r)) - g(x^r_∅ ∪ x^(r))
+                           g(x^r u x^(r)) - g(x^r_∅ u x^(r))
     gamma            : D-UCT discount factor ∈ (0.5, 1)
     Cp               : exploration constant  (paper: Cp > 1/sqrt(8) ≈ 0.354)
     rollout_depth    : max depth for random rollout simulation
@@ -143,7 +143,7 @@ class DecMCTS:
     num_samples      : MC samples for expectation estimates in dist update
     beta_init        : initial temperature β for distribution optimization
     beta_decay       : multiplicative cooling per outer iteration
-    alpha            : gradient step size (paper: α = 0.01)
+    alpha            : gradient step size (paper: alpha = 0.01)
     """
 
     def __init__(
@@ -250,7 +250,7 @@ class DecMCTS:
         """
         self.t += 1
 
-        # ── Selection: D-UCT descent ──────────────────────
+        # Selection: D-UCT descent
         node = self.root
         path = [node]
         while not node.is_terminal() and node.is_fully_expanded() and node.children:
@@ -260,14 +260,14 @@ class DecMCTS:
             )
             path.append(node)
 
-        # ── Expansion: add one untried child ──────────────
+        # Expansion: add one untried child
         if not node.is_terminal() and not node.is_fully_expanded():
             action     = random.choice(node.untried_actions)
             next_state = node.state.take_action(action)
             node       = node.add_child(action, next_state)
             path.append(node)
 
-        # ── Simulation: random rollout from node ──────────
+        # Simulation: random rollout from node 
         rollout_actions = self._rollout(node)
         x_r = node.action_sequence + rollout_actions
 
@@ -278,7 +278,7 @@ class DecMCTS:
         joint = {**x_others, self.robot_id: x_r}
         F_t   = self.local_utility_fn(joint)
 
-        # ── Backpropagation ───────────────────────────────
+        # Backpropagation
         self._backprop(path, F_t)
 
     def _rollout(self, node):
@@ -300,16 +300,27 @@ class DecMCTS:
         """
         Backpropagate F_t along path (Algorithm 2, line 8).
 
-        Updates both undiscounted stats (visits, cum_reward) and
-        D-UCT discounted stats (disc_visits, disc_reward) for all nodes on path.
+        Updates undiscounted stats (visits, cum_reward) for visited nodes only.
 
+        D-UCT requires the gamma decay to be applied to ALL nodes every iteration,
+        not just the visited path. Nodes on the path get visited=True (adds 1 and F_t
+        on top of the decay); every other node gets visited=False (decay only). This
+        is what makes D-UCT properly de-emphasize stale statistics over time.
         """
-        for node in path:
-            node.visits     += 1
-            node.cum_reward += F_t
-            node.update_discounted(F_t, visited=True, gamma=self.gamma)
+        path_set = set(id(n) for n in path)
 
-    # ALGORITHM 3: UPDATE DISTRIBUTION
+        # Collect every node in the tree via DFS
+        all_nodes = []
+        self._collect_nodes(self.root, all_nodes)
+
+        for node in all_nodes:
+            on_path = id(node) in path_set
+            if on_path:
+                node.visits     += 1
+                node.cum_reward += F_t
+            node.update_discounted(F_t, visited=on_path, gamma=self.gamma)
+
+    # UPDATE DISTRIBUTION
     def _update_sample_space(self):
         """
         Select X̂^r_n as the num_seq nodes with highest disc_q in tree.
@@ -351,7 +362,7 @@ class DecMCTS:
         if not self.X_hat:
             return
 
-        # Estimate E_{q_n}[f^r]  (Algorithm 3, line 3)
+        # Estimate E_{q_n}[f^r]
         E_f = self._estimate_expectation(fixed_xr=None)
 
         # Entropy H(q^r_n)
@@ -365,13 +376,13 @@ class DecMCTS:
             q_val = self.q.get(xr_tup, 1.0 / len(self.X_hat))
             ln_q  = math.log(q_val) if q_val > 1e-12 else -100.0
 
-            # Algorithm 3 line 5
+            # Algorithm 3 line 5 -- first order additive approximation for compute purposes
             delta = self.alpha * q_val * (
                 (E_f - E_f_given_xr) / self.beta  +  H  +  ln_q
             )
             new_q[xr_tup] = max(1e-12, q_val - delta)
 
-        # Normalize  (Algorithm 3, line 6)
+        # Normalize
         total = sum(new_q.values())
         if total > 0:
             self.q = {k: v / total for k, v in new_q.items()}
@@ -461,20 +472,25 @@ class DecMCTSTeam:
         """
         self.planners = planners
 
-    def iterate_and_communicate(self, n_outer=1):
+    def iterate_and_communicate(self, n_outer=1, comm_period=1):
         """
-        Run n_outer outer iterations for all robots, then broadcast
-        each robot's distribution to all others (synchronous comms).
-        """
-        for p in self.planners.values():
-            p.iterate(n_outer)
+        Run n_outer outer iterations for all robots, broadcasting
+        distributions every comm_period outer iterations.
 
-        # Communicate
-        for rid, planner in self.planners.items():
-            X_hat, q = planner.get_distribution()
-            for other_id, other_planner in self.planners.items():
-                if other_id != rid:
-                    other_planner.receive_dist_dict(rid, q)
+        comm_period=1  : communicate after every outer iteration (default)
+        comm_period=K  : communicate once every K outer iterations
+        comm_period=-1 : never communicate (fully decentralized / no comms)
+        """
+        for i in range(1, n_outer + 1):
+            for p in self.planners.values():
+                p.iterate(1)
+
+            if comm_period > 0 and i % comm_period == 0:
+                for rid, planner in self.planners.items():
+                    _, q = planner.get_distribution()
+                    for other_id, other_planner in self.planners.items():
+                        if other_id != rid:
+                            other_planner.receive_dist_dict(rid, q)
 
     def best_sequences(self):
         """Return {robot_id: action_sequence} for all robots."""
