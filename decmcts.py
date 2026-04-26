@@ -1,6 +1,4 @@
 """
-decmcts.py
-----------
 Dec-MCTS implementation:
 Builds on the single-agent MCTS base in Scripts/mcts.py.
 
