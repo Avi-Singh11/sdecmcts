@@ -87,21 +87,25 @@ class DecMCTSNode:
 
     # D-UCT upper confidence bound
 
-    def d_ucb(self, parent, t, gamma, Cp):
+    def d_ucb(self, parent, t, gamma, Cp, min_reward, max_reward):
         """
-        D-UCT score (Equation 3 / 7):
-
-            U = F̄_j(gamma) + 2*Cp * sqrt( log(disc_visits_parent) / disc_visits_j )
-
-        Returns inf for unvisited nodes or when parent has too few visits
-        (log(x) < 0 for x < 1).
+        D-UCT score (Equation 3 / 7), normalized dynamically.
         """
         if self.disc_visits == 0:
             return float("inf")
         if parent.disc_visits <= 1.0:
             return float("inf")
+        
         exploration = 2.0 * Cp * math.sqrt(math.log(parent.disc_visits) / self.disc_visits)
-        return self.disc_q() + exploration
+        
+        # Normalize Q value to [0, 1] range using tracked min/max
+        q = self.disc_q()
+        if max_reward > min_reward:
+            norm_q = (q - min_reward) / (max_reward - min_reward)
+        else:
+            norm_q = 0.5
+            
+        return norm_q + exploration
 
     def update_discounted(self, reward, visited, gamma):
         """
@@ -172,6 +176,9 @@ class DecMCTS:
         self.beta             = beta_init
         self.beta_decay       = beta_decay
         self.alpha            = alpha
+        
+        self.min_reward = float("inf")
+        self.max_reward = float("-inf")
 
         # Search tree T^r
         self.root = DecMCTSNode(init_state)
@@ -254,7 +261,7 @@ class DecMCTS:
         while not node.is_terminal() and node.is_fully_expanded() and node.children:
             node = max(
                 node.children,
-                key=lambda c: c.d_ucb(node, self.t, self.gamma, self.Cp)
+                key=lambda c: c.d_ucb(node, self.t, self.gamma, self.Cp, self.min_reward, self.max_reward)
             )
             path.append(node)
 
@@ -275,6 +282,10 @@ class DecMCTS:
         # Evaluate local utility f^r
         joint = {**x_others, self.robot_id: x_r}
         F_t   = self.local_utility_fn(joint)
+        
+        # Track reward bounds for dynamic normalization
+        if F_t < self.min_reward: self.min_reward = F_t
+        if F_t > self.max_reward: self.max_reward = F_t
 
         # Backpropagation
         self._backprop(path, F_t)
@@ -335,11 +346,19 @@ class DecMCTS:
             if n.action_sequence   # exclude root (empty sequence)
         ][:self.num_seq]
 
-        # Reset to uniform when sample space changes
+        # Preserve probabilities when sample space changes
         if set(new_X_hat) != set(self.X_hat):
+            new_q = {}
+            fallback_prob = 1.0 / max(len(new_X_hat), 1)
+            for xr in new_X_hat:
+                new_q[xr] = self.q.get(xr, fallback_prob)
+            # Normalize
+            total = sum(new_q.values())
+            if total > 0:
+                self.q = {k: v / total for k, v in new_q.items()}
+            else:
+                self.q = {k: fallback_prob for k in new_X_hat}
             self.X_hat = new_X_hat
-            n = max(len(self.X_hat), 1)
-            self.q = {s: 1.0 / n for s in self.X_hat}
 
     def _collect_nodes(self, node, out):
         """DFS to collect all nodes in tree."""
@@ -374,9 +393,13 @@ class DecMCTS:
             q_val = self.q.get(xr_tup, 1.0 / len(self.X_hat))
             ln_q  = math.log(q_val) if q_val > 1e-12 else -100.0
 
+            # Normalize expected rewards to [0,1] scale so alpha step size remains stable
+            norm_E_f = (E_f - self.min_reward) / (self.max_reward - self.min_reward) if self.max_reward > self.min_reward else 0.5
+            norm_E_f_given_xr = (E_f_given_xr - self.min_reward) / (self.max_reward - self.min_reward) if self.max_reward > self.min_reward else 0.5
+
             # Algorithm 3 line 5 -- first order additive approximation for compute purposes
             delta = self.alpha * q_val * (
-                (E_f - E_f_given_xr) / self.beta  +  H  +  ln_q
+                (norm_E_f - norm_E_f_given_xr) / self.beta  +  H  +  ln_q
             )
             new_q[xr_tup] = max(1e-12, q_val - delta)
 

@@ -151,7 +151,13 @@ def make_medevac_objective(init_positions):
             for r in robot_ids:
                 if r not in joint_paths:
                     joint_paths[r] = [init_positions[r]]
-            return global_obj(joint_paths)
+
+            # Marginal contribution: G(x^r ∪ x^{-r}) - G(∅ ∪ x^{-r})
+            # Null path for rid = stay at initial position (no actions taken).
+            null_paths = dict(joint_paths)
+            null_paths[rid] = [init_positions[rid]]
+            return global_obj(joint_paths) - global_obj(null_paths)
+
         return local_fn
 
     local_obj_fns = {rid: make_local_fn(rid) for rid in robot_ids}

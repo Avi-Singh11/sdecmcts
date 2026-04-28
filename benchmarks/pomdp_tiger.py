@@ -74,6 +74,11 @@ class TigerModel:
         self.O = [0.0] * (nso * N_ACTS)
         self.R = [0.0] * (N_STATES * N_ACTS)
         self.init_belief = [1.0 / N_STATES] * N_STATES
+        # Attributes required by cpde_decmcts.py
+        self.n_states      = N_STATES
+        self.n_obs         = N_OBS
+        self.act_per_agent = ACT_PER_AGENT
+        self.obs_per_agent = OBS_PER_AGENT
         self._build()
 
     def _set_o(self, a, sp, o, val):
@@ -262,7 +267,11 @@ def make_tiger_pomdp_objectives(model, n_mc=N_MC_SAMPLES):
         def local_fn(joint_action_seqs):
             total = sum(_simulate_episode(_sample_init(), joint_action_seqs, model)
                         for _ in range(n_mc))
-            return total / n_mc
+            null_seqs = dict(joint_action_seqs)
+            null_seqs[rid] = []
+            null_total = sum(_simulate_episode(_sample_init(), null_seqs, model)
+                             for _ in range(n_mc))
+            return (total - null_total) / n_mc
         return local_fn
 
     local_obj_fns = {rid: make_local_fn(rid) for rid in range(N_AGENTS)}
@@ -344,7 +353,11 @@ def make_objectives_from_particles(particles, model, n_mc=N_MC_SAMPLES):
         def local_fn(joint_action_seqs):
             total = sum(_simulate_episode(_sample_belief(), joint_action_seqs, model)
                         for _ in range(n_mc))
-            return total / n_mc
+            null_seqs = dict(joint_action_seqs)
+            null_seqs[rid] = []
+            null_total = sum(_simulate_episode(_sample_belief(), null_seqs, model)
+                             for _ in range(n_mc))
+            return (total - null_total) / n_mc
         return local_fn
 
     local_obj_fns = {rid: make_local_fn(rid) for rid in range(N_AGENTS)}

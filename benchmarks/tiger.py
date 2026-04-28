@@ -117,10 +117,16 @@ def make_tiger_objective(tiger_pos, horizon=DEFAULT_HORIZON):
         def local_fn(joint_action_seqs):
             my_seq    = list(joint_action_seqs.get(rid,   []))
             other_seq = list(joint_action_seqs.get(other, []))
+            
+            # Absolute reward
             if rid == 0:
-                return _reward_from_seqs(tiger_pos, my_seq, other_seq)
+                total = _reward_from_seqs(tiger_pos, my_seq, other_seq)
+                null_total = _reward_from_seqs(tiger_pos, [], other_seq) # Empty means all padded with LISTEN
             else:
-                return _reward_from_seqs(tiger_pos, other_seq, my_seq)
+                total = _reward_from_seqs(tiger_pos, other_seq, my_seq)
+                null_total = _reward_from_seqs(tiger_pos, other_seq, [])
+                
+            return total - null_total
 
         return local_fn
 

@@ -150,7 +150,6 @@ def make_mars_objective(init_positions):
 
     # ── local_obj_fns (pure action-seq format) ────────────────────────────────
     def make_local_fn(rid):
-        init = init_positions[rid]
 
         def local_fn(joint_action_seqs):
             # Convert action sequences to full paths (prepend initial position)
@@ -163,7 +162,14 @@ def make_mars_objective(init_positions):
                 if r not in joint_paths:
                     joint_paths[r] = [init_positions[r]]
 
-            return global_obj(joint_paths)
+            # Marginal contribution: G(x^r ∪ x^{-r}) - G(∅ ∪ x^{-r})
+            # Null path for rid = stay at initial position (no actions taken).
+            # Essential for submodular coverage: without the baseline, both
+            # robots see full team reward regardless of overlap, incentivising
+            # clustering rather than complementary rock coverage.
+            null_paths = dict(joint_paths)
+            null_paths[rid] = [init_positions[rid]]
+            return global_obj(joint_paths) - global_obj(null_paths)
 
         return local_fn
 

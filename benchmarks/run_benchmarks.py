@@ -52,9 +52,9 @@ from benchmarks.labyrinth import make_labyrinth_benchmark
 
 # ── DEFAULTS ──────────────────────────────────────────────────────────────────
 
-SDEC_ITERS       = 80
-CEN_ITERS        = 300
-DEC_OUTER_ITERS  = 30
+SDEC_ITERS       = 300
+CEN_ITERS        = 1000
+DEC_OUTER_ITERS  = 100
 DEC_TAU          = 10
 COMM_PROBS       = [1.0, 0.6, 0.1]
 # comm_period values for gated Dec-MCTS:
@@ -62,7 +62,7 @@ COMM_PROBS       = [1.0, 0.6, 0.1]
 #   5  = try every 5 outer iterations
 #  -1  = never communicate
 GATED_COMM_PERIODS = [1, 5, -1]
-TRIALS           = 3
+TRIALS           = 5
 SEED             = 42
 
 # DecMCTS hyperparams (used by run_decmcts / run_decmcts_gated)
@@ -145,7 +145,7 @@ def run_decmcts_gated(robot_ids, init_states, global_obj, local_obj_fns,
     At outer iteration i, communication is attempted only when
       i % comm_period == 0
     AND
-      can_communicate holds at the first step of the current best plan.
+      can_communicate holds at any step along the current best joint plan.
 
     This matches the paper setting: "only update/communicate at the overlap of
     the Dec-MCTS fixed period and when the benchmark actually allows it."
@@ -166,16 +166,27 @@ def run_decmcts_gated(robot_ids, init_states, global_obj, local_obj_fns,
         for rid in robot_ids
     }
 
-    def _post_first_action_states():
-        """Simulate each robot's state after its best first planned action."""
-        result = {}
-        for rid in robot_ids:
-            seq = planners[rid].best_action_sequence()
-            s = init_states[rid]
-            if seq:
-                s = s.take_action(seq[0])
-            result[rid] = s
-        return result
+    def _can_comm_along_plan():
+        """
+        True if can_communicate holds at any step of the current best joint plan.
+
+        Simulates each robot's state through its planned action sequence and
+        checks comm eligibility at each step (including the initial positions).
+        This is a much better proxy than checking only after the first action,
+        which almost always returns False when robots start apart.
+        """
+        seqs   = {rid: planners[rid].best_action_sequence() for rid in robot_ids}
+        states = {rid: init_states[rid] for rid in robot_ids}
+        if can_communicate(states[robot_ids[0]], states[robot_ids[1]]):
+            return True
+        max_len = max((len(s) for s in seqs.values()), default=0)
+        for step in range(max_len):
+            for rid in robot_ids:
+                if step < len(seqs[rid]):
+                    states[rid] = states[rid].take_action(seqs[rid][step])
+            if can_communicate(states[robot_ids[0]], states[robot_ids[1]]):
+                return True
+        return False
 
     t0 = time.perf_counter()
 
@@ -184,11 +195,7 @@ def run_decmcts_gated(robot_ids, init_states, global_obj, local_obj_fns,
             p.iterate(1)
 
         if comm_period > 0 and i % comm_period == 0:
-            # Gate by benchmark constraint: check can_communicate at planned
-            # first-action positions (proxy for when agents would actually meet)
-            post_states = _post_first_action_states()
-            s0, s1 = post_states[robot_ids[0]], post_states[robot_ids[1]]
-            if can_communicate(s0, s1):
+            if _can_comm_along_plan():
                 for rid, planner in planners.items():
                     _, q = planner.get_distribution()
                     for other_id, other_planner in planners.items():
