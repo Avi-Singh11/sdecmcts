@@ -43,6 +43,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from decmcts import DecMCTS, DecMCTSTeam
 import decmcts
 
+from obs_decmcts import ObsDecMCTS, ObsDecMCTSTeam, StepResult, History
+import obs_decmcts
+
 
 # =============================================================================
 # Constants
@@ -218,6 +221,39 @@ class TigerModel:
             if (agent_id == 0 and o0 == local_o) or (agent_id == 1 and o1 == local_o):
                 total += self.obs_prob(sp, joint_a, joint_o)
         return total
+
+# =============================================================================
+# Wrapper adapting tiger benchmark to observation-conditioned decmcts
+# =============================================================================
+
+class TigerObsModelAdapter:
+    """
+    Thin generative adapter expected by ObsDecMCTS.
+    Wraps the existing TigerModel.
+    """
+
+    def __init__(self, model: TigerModel):
+        self.model = model
+
+    def sample_state_from_belief(self, belief, rng: random.Random) -> int:
+        r = rng.random()
+        return TIGER_LEFT if r < belief[TIGER_LEFT] else TIGER_RIGHT
+
+    def joint_action_from_dict(self, actions: Dict[int, int]) -> int:
+        return self.model.joint_action(actions[0], actions[1])
+
+    def step(self, state: int, joint_action: int, rng: random.Random) -> StepResult:
+        reward = self.model.reward(state, joint_action)
+        next_state = self.model.sample_next_state(state, joint_action, rng)
+        joint_obs = self.model.sample_joint_obs(next_state, joint_action, rng)
+        return StepResult(
+            next_state=next_state,
+            joint_obs=joint_obs,
+            reward=reward,
+        )
+
+    def split_obs(self, joint_obs: int) -> Tuple[int, int]:
+        return self.model.split_obs(joint_obs)
 
 # =============================================================================
 # Planning state and exact belief calculations
@@ -430,6 +466,83 @@ def make_tiger_rollout_policy(
 
     return rollout_policy
 
+def tiger_legal_actions_from_history(history: History, depth: int) -> List[int]:
+    return [OPEN_LEFT, OPEN_RIGHT, LISTEN]
+
+def tiger_default_action_from_history(history: History) -> int:
+    # Safe default for unexplored policy-tree histories.
+    return LISTEN
+
+# # REMOVE/CHECK
+def tiger_legal_actions_from_history(history: History, depth: int) -> List[int]:
+    # Put LISTEN first for Tiger. This is safer for low-budget policy support.
+    return [LISTEN, OPEN_LEFT, OPEN_RIGHT]
+
+
+def tiger_belief_from_local_history(history: History) -> List[float]:
+    """
+    Approximate local belief induced by an agent's own listen observations.
+
+    This is only for rollout/default policy behavior inside ObsDecMCTS.
+    The real online episode still uses exact Bayes updates on the actual belief.
+    """
+    b = [0.5, 0.5]
+
+    for action, obs in history:
+        if action == LISTEN:
+            b = normalize_belief([
+                b[TIGER_LEFT] * (0.75 if obs == TIGER_LEFT else 0.25),
+                b[TIGER_RIGHT] * (0.75 if obs == TIGER_RIGHT else 0.25),
+            ])
+        elif action in (OPEN_LEFT, OPEN_RIGHT):
+            # Opening resets the tiger uniformly.
+            b = [0.5, 0.5]
+
+    return b
+
+
+def make_tiger_legal_actions_fn(
+    root_belief: Sequence[float],
+    open_threshold: float,
+):
+    def legal_actions(history: History, depth: int) -> List[int]:
+        if history == ():
+            root_action = heuristic_action_from_belief(
+                root_belief,
+                open_threshold=open_threshold,
+            )
+
+            if root_action == LISTEN:
+                return [LISTEN, OPEN_LEFT, OPEN_RIGHT]
+
+            # If root belief is confident, still allow LISTEN as fallback,
+            # but do not include the obviously wrong open.
+            return [root_action, LISTEN]
+
+        return [LISTEN, OPEN_LEFT, OPEN_RIGHT]
+
+    return legal_actions
+
+
+def make_tiger_default_action_fn(
+    root_belief: Sequence[float],
+    open_threshold: float,
+):
+    def default_action(history: History) -> int:
+        if history == ():
+            return heuristic_action_from_belief(
+                root_belief,
+                open_threshold=open_threshold,
+            )
+
+        local_belief = tiger_belief_from_local_history(history)
+        return heuristic_action_from_belief(
+            local_belief,
+            open_threshold=open_threshold,
+        )
+
+    return default_action
+
 
 # =============================================================================
 # Online Dec-MCTS episode simulation
@@ -513,6 +626,218 @@ def run_planning_step(
 
     return actions, raw_actions, sequences, team.entropies(), root_masses
 
+# def run_obs_planning_step(
+#     beliefs: Dict[int, List[float]],
+#     remaining_horizon: int,
+#     model: TigerModel,
+#     args,
+#     seed: int,
+# ):
+#     """
+#     Observation-conditioned Dec-MCTS planning step.
+
+#     Unlike run_planning_step(), this planner searches over partial policy trees:
+#         local action-observation history -> action
+
+#     The returned action is the action at root local history ().
+#     """
+#     planners = {}
+#     adapter = TigerObsModelAdapter(model)
+
+#     for rid in range(N_AGENTS):
+#         planners[rid] = ObsDecMCTS(
+#             robot_id=rid,
+#             robot_ids=[0, 1],
+#             root_belief=beliefs[rid],
+#             model=adapter,
+#             legal_actions_fn=tiger_legal_actions_from_history,
+#             default_action_fn=tiger_default_action_from_history,
+#             gamma=args.gamma,
+#             cp=args.cp,
+#             horizon=remaining_horizon,
+#             tau=args.tau,
+#             num_policies=args.num_seq,
+#             num_samples=args.num_samples,
+#             beta_init=args.beta_init,
+#             beta_decay=args.beta_decay,
+#             alpha=args.alpha,
+#             seed=seed + 1009 * rid,
+#         )
+    
+#     # REMOVE
+#     for rid, planner in planners.items():
+#         print("DEBUG obs root edges", rid, ObsDecMCTS.obs_root_edge_stats(planner))
+
+#     team = ObsDecMCTSTeam(planners)
+#     team.iterate_and_communicate(
+#         n_outer=args.outer_iters,
+#         comm_period=args.comm_period,
+#     )
+
+#     raw_actions = {}
+#     actions = {}
+#     policies = team.best_policies()
+
+#     for rid in range(N_AGENTS):
+#         raw_a = int(planners[rid].best_action(history=()))
+#         raw_actions[rid] = raw_a
+
+#         if getattr(args, "guard_actions", False):
+#             actions[rid] = guard_tiger_action(
+#                 belief=beliefs[rid],
+#                 proposed_action=raw_a,
+#                 open_threshold=args.open_threshold,
+#                 force_open_when_confident=getattr(args, "force_open_when_confident", False),
+#             )
+#         else:
+#             actions[rid] = raw_a
+
+#     root_masses = {
+#         rid: obs_root_action_masses(planner)
+#         for rid, planner in planners.items()
+#     }
+
+#     return actions, raw_actions, policies, team.entropies(), root_masses
+def obs_root_edge_stats(planner):
+    out = {}
+    for a, edge in planner.root.actions.items():
+        out[ACTION_NAME[a]] = {
+            "visits": edge.visits,
+            "q": round(edge.q(), 3),
+            "disc_visits": round(edge.disc_visits, 3),
+            "disc_q": round(edge.disc_q(), 3),
+            "num_obs_children": len(edge.obs_children),
+        }
+    return out
+
+def obs_root_teammate_debug(planner):
+    teammate = {
+        ACTION_NAME[a]: c
+        for a, c in planner.debug_root_teammate_actions.items()
+    }
+
+    joint = {
+        f"{ACTION_NAME[a0]},{ACTION_NAME[a1]}": c
+        for (a0, a1), c in planner.debug_root_joint_actions.items()
+    }
+
+    return {
+        "teammate_actions": teammate,
+        "joint_actions_from_planner_perspective": joint,
+    }
+
+def run_obs_planning_step(
+    beliefs: Dict[int, List[float]],
+    remaining_horizon: int,
+    model: TigerModel,
+    args,
+    seed: int,
+):
+    """
+    Observation-conditioned Dec-MCTS planning step.
+
+    This planner searches over partial policy trees:
+        local action-observation history -> action
+
+    The returned action is the action at root local history ().
+    """
+    planners = {}
+    adapter = TigerObsModelAdapter(model)
+
+    for rid in range(N_AGENTS):
+        planners[rid] = ObsDecMCTS(
+            robot_id=rid,
+            robot_ids=[0, 1],
+            root_belief=beliefs[rid],
+            model=adapter,
+            legal_actions_fn=tiger_legal_actions_from_history,
+            default_action_fn=tiger_default_action_from_history,
+
+            # legal_actions_fn=make_tiger_legal_actions_fn(
+            # root_belief=beliefs[rid],
+            # open_threshold=args.open_threshold,
+            # ),
+            # default_action_fn=make_tiger_default_action_fn(
+            # root_belief=beliefs[rid],
+            # open_threshold=args.open_threshold,
+            # ),
+            gamma=args.gamma,
+            cp=args.cp,
+            horizon=remaining_horizon,
+            tau=args.tau,
+            num_policies=args.num_seq,
+            num_samples=args.num_samples,
+            beta_init=args.beta_init,
+            beta_decay=args.beta_decay,
+            alpha=args.alpha,
+            seed=seed + 1009 * rid,
+        )
+
+    team = ObsDecMCTSTeam(planners)
+
+    team.iterate_and_communicate(
+        n_outer=args.outer_iters,
+        comm_period=args.comm_period,
+    )
+
+    # DEBUG: must be after iterate_and_communicate.
+    if getattr(args, "debug_obs", False):
+        for rid, planner in planners.items():
+            print(
+                f"DEBUG obs planner {rid}: "
+                f"root_actions={list(ACTION_NAME[a] for a in planner.root.actions.keys())} "
+                f"root_visits={planner.root.visits} "
+                f"num_X_hat={len(planner.X_hat)} "
+                f"num_q={len(planner.q)} "
+                f"entropy={team.entropies().get(rid, 0.0):.3f} "
+                f"min_reward={planner.min_reward:.3f} "
+                f"max_reward={planner.max_reward:.3f}",
+                flush=True,
+            )
+
+            print(
+                f"DEBUG obs root edges {rid}: "
+                f"{obs_root_edge_stats(planner)}",
+                flush=True,
+            )
+
+            print(
+                f"DEBUG obs teammate model {rid}: "
+                f"{obs_root_teammate_debug(planner)}",
+                flush=True,
+            )
+
+            print(
+                f"DEBUG obs policy support {rid}: "
+                f"{obs_policy_support_debug(planner)}",
+                flush=True,
+            )
+
+    raw_actions = {}
+    actions = {}
+    policies = team.best_policies()
+
+    for rid in range(N_AGENTS):
+        raw_a = int(planners[rid].best_action(history=()))
+        raw_actions[rid] = raw_a
+
+        if getattr(args, "guard_actions", False):
+            actions[rid] = guard_tiger_action(
+                belief=beliefs[rid],
+                proposed_action=raw_a,
+                open_threshold=args.open_threshold,
+                force_open_when_confident=getattr(args, "force_open_when_confident", False),
+            )
+        else:
+            actions[rid] = raw_a
+
+    root_masses = {
+        rid: obs_root_action_masses(planner)
+        for rid, planner in planners.items()
+    }
+
+    return actions, raw_actions, policies, team.entropies(), root_masses
+
 def guard_tiger_action(
     belief,
     proposed_action,
@@ -591,13 +916,46 @@ def simulate_online_episode(
     for t in range(args.horizon):
         remaining = args.horizon - t
 
-        actions, raw_actions, sequences, entropies, root_masses = run_planning_step(
-            beliefs=beliefs,
-            remaining_horizon=remaining,
-            model=model,
-            args=args,
-            seed=episode_seed + 7919 * t,
-        )
+        if verbose:
+            print(
+                f"DEBUG entering t={t}, remaining={remaining}, "
+                f"planner={getattr(args, 'planner', 'open-loop')}"
+            )
+
+        if getattr(args, "planner", "open-loop") == "obs":
+            actions, raw_actions, plans, entropies, root_masses = run_obs_planning_step(
+                beliefs=beliefs,
+                remaining_horizon=remaining,
+                model=model,
+                args=args,
+                seed=episode_seed + 7919 * t,
+            )
+        else:
+            actions, raw_actions, plans, entropies, root_masses = run_planning_step(
+                beliefs=beliefs,
+                remaining_horizon=remaining,
+                model=model,
+                args=args,
+                seed=episode_seed + 7919 * t,
+            )
+            ## REMOVE
+        if verbose or getattr(args, "debug_obs", False):
+            print(
+                f"DEBUG expected one-step rewards t={t}: "
+                f"belief0={[round(x, 3) for x in beliefs[0]]} "
+                f"belief1={[round(x, 3) for x in beliefs[1]]} "
+                f"values_b0={all_one_step_expected_rewards(beliefs[0], model)} "
+                f"values_b1={all_one_step_expected_rewards(beliefs[1], model)}",
+                flush=True,
+            )
+
+        if verbose:
+            print(
+                f"DEBUG planned t={t}: "
+                f"raw=({ACTION_NAME[raw_actions[0]]},{ACTION_NAME[raw_actions[1]]}), "
+                f"exec=({ACTION_NAME[actions[0]]},{ACTION_NAME[actions[1]]}), "
+                f"root_mass={root_masses}"
+            )
 
         pre_beliefs = {
             0: list(beliefs[0]),
@@ -614,11 +972,9 @@ def simulate_online_episode(
         joint_o = model.sample_joint_obs(next_state, joint_a, rng)
         o0, o1 = model.split_obs(joint_o)
 
-        # Each agent first updates using only its own private local observation.
         beliefs[0] = update_local_belief(beliefs[0], joint_a, o0, 0, model)
         beliefs[1] = update_local_belief(beliefs[1], joint_a, o1, 1, model)
 
-        # Store the full joint action/observation so it can be shared later.
         pending_history.append((joint_a, joint_o))
 
         if should_env_communicate(args, t, a0, a1):
@@ -643,19 +999,20 @@ def simulate_online_episode(
                 f"next={'LEFT' if next_state == TIGER_LEFT else 'RIGHT'} "
                 f"belief0={[round(x,3) for x in beliefs[0]]} "
                 f"belief1={[round(x,3) for x in beliefs[1]]} "
-                f"H={{{0}: {entropies.get(0,0):.3f}, {1}: {entropies.get(1,0):.3f}}}"
+                f"H={{{0}: {entropies.get(0,0):.3f}, {1}: {entropies.get(1,0):.3f}}} "
                 f"raw_actions=({ACTION_NAME[raw_actions[0]]},{ACTION_NAME[raw_actions[1]]}) "
                 f"exec_actions=({ACTION_NAME[a0]},{ACTION_NAME[a1]})"
             )
-
             print(f"    pre_belief0={[round(x, 3) for x in pre_beliefs[0]]}")
             print(f"    pre_belief1={[round(x, 3) for x in pre_beliefs[1]]}")
-            print(f"    candidate_values_b0={candidate_values[0]}")
-            print(f"    candidate_values_b1={candidate_values[1]}")
-                
-            print(f"    seq0={[ACTION_NAME[x] for x in sequences[0]]}")
-            print(f"    seq1={[ACTION_NAME[x] for x in sequences[1]]}")
             print(f"    root_mass={root_masses}")
+
+            if getattr(args, "planner", "open-loop") == "obs":
+                print(f"    policy0_root={ACTION_NAME[plans[0].action(())]}")
+                print(f"    policy1_root={ACTION_NAME[plans[1].action(())]}")
+            else:
+                print(f"    seq0={[ACTION_NAME[x] for x in plans[0]]}")
+                print(f"    seq1={[ACTION_NAME[x] for x in plans[1]]}")
 
         true_state = next_state
 
@@ -680,6 +1037,72 @@ def root_action_masses(planner):
             masses[seq[0]] += p
 
     return {ACTION_NAME[a]: round(v, 4) for a, v in masses.items()}
+
+def expected_one_step_reward(belief, a0, a1, model):
+    joint_a = model.joint_action(a0, a1)
+    return sum(
+        belief[s] * model.reward(s, joint_a)
+        for s in range(N_STATES)
+    )
+
+def obs_root_action_masses(planner):
+    masses = {OPEN_LEFT: 0.0, OPEN_RIGHT: 0.0, LISTEN: 0.0}
+
+    for policy_key, p in planner.q.items():
+        root_action = None
+
+        for hist, action in policy_key:
+            if hist == ():
+                root_action = action
+                break
+
+        if root_action is not None:
+            masses[root_action] += p
+
+    return {ACTION_NAME[a]: round(v, 4) for a, v in masses.items()}
+
+
+def all_one_step_expected_rewards(belief, model):
+    pairs = [
+        (OPEN_LEFT, OPEN_LEFT),
+        (OPEN_LEFT, OPEN_RIGHT),
+        (OPEN_LEFT, LISTEN),
+        (OPEN_RIGHT, OPEN_LEFT),
+        (OPEN_RIGHT, OPEN_RIGHT),
+        (OPEN_RIGHT, LISTEN),
+        (LISTEN, OPEN_LEFT),
+        (LISTEN, OPEN_RIGHT),
+        (LISTEN, LISTEN),
+    ]
+
+    return {
+        f"{ACTION_NAME[a0]},{ACTION_NAME[a1]}": round(
+            expected_one_step_reward(belief, a0, a1, model),
+            3,
+        )
+        for a0, a1 in pairs
+    }
+
+
+def obs_policy_support_debug(planner):
+    out = []
+
+    for policy_key, p in sorted(planner.q.items(), key=lambda kv: kv[1], reverse=True):
+        root_action = None
+        num_entries = len(policy_key)
+
+        for hist, action in policy_key:
+            if hist == ():
+                root_action = action
+                break
+
+        out.append({
+            "p": round(p, 4),
+            "root": ACTION_NAME[root_action] if root_action is not None else None,
+            "num_entries": num_entries,
+        })
+
+    return out
 
         
 def run_episode_worker(payload):
@@ -738,6 +1161,8 @@ def main() -> None:
 
     parser.add_argument("--env-comm-mode", choices=["periodic", "both-listen", "none"], default="periodic", help="Execution-time observation sharing mode.")
     parser.add_argument("--diverse-sample-space", action="store_true")
+    parser.add_argument("--planner", choices=["open-loop", "obs"], default="open-loop", help="Planner backend: vanilla open-loop DecMCTS or observation-conditioned ObsDecMCTS.")
+    parser.add_argument("--debug-obs", action="store_true", help="Print ObsDecMCTS tree, edge, policy-support, and one-step reward diagnostics.")
 
     # Adding parallelism across all cores
     parser.add_argument(
@@ -761,7 +1186,13 @@ def main() -> None:
         f"env_comm_period={args.env_comm_period}, seed={args.seed}")
     print()
 
-    print("MAIN using decmcts from:", decmcts.__file__, flush=True)
+    print(
+        f"utility={args.local_utility}, open_threshold={args.open_threshold}, "
+        f"env_comm_mode={args.env_comm_mode}, env_comm_period={args.env_comm_period}, "
+        f"guard_actions={args.guard_actions}, "
+        f"planner={getattr(args, 'planner', 'open-loop')}, "
+        f"seed={args.seed}"
+    )
 
     returns = []
 

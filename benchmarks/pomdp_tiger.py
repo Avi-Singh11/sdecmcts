@@ -97,8 +97,8 @@ class TigerModel:
                 for sp in range(N_STATES):
                     for o in range(N_OBS):
                         b0, b1 = o % OBS_PER_AGENT, o // OBS_PER_AGENT
-                        p0 = 0.15 + 0.7 * (sp == b0)
-                        p1 = 0.15 + 0.7 * (sp == b1)
+                        p0 = 0.75 if b0 == sp else 0.25
+                        p1 = 0.75 if b1 == sp else 0.25
                         self._set_o(8, sp, o, p0 * p1)
             else:
                 # Any open action: tiger resets uniformly, uniform obs
@@ -407,3 +407,145 @@ def make_tiger_pomdp_benchmark(horizon=DEFAULT_HORIZON,
 
     global_obj, local_obj_fns = make_tiger_pomdp_objectives(model, n_mc)
     return robot_ids, init_states, global_obj, local_obj_fns, can_communicate
+
+
+# import sys
+# import os
+# import random
+# import math
+# import time
+
+# # Dynamic pathing to find decmcts.py in the root folder
+# sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# from decmcts import DecMCTS, DecMCTSTeam
+
+# # Actions: 0 = LISTEN, 1 = OPEN_LEFT, 2 = OPEN_RIGHT
+# LISTEN, OPEN_LEFT, OPEN_RIGHT = 0, 1, 2
+
+# class TigerSearchState:
+#     def __init__(self, depth=0, max_horizon=8):
+#         self.depth = depth
+#         self.max_horizon = max_horizon
+
+#     def get_legal_actions(self):
+#         return [] if self.is_terminal_state() else [LISTEN, OPEN_LEFT, OPEN_RIGHT]
+
+#     def take_action(self, action):
+#         return TigerSearchState(self.depth + 1, self.max_horizon)
+
+#     def is_terminal_state(self):
+#         return self.depth >= self.max_horizon
+
+# class TigerUtility:
+#     def __init__(self, horizon=8, n_samples=40):
+#         self.horizon = horizon
+#         self.n_samples = n_samples
+
+#     def g(self, joint_sequences):
+#         """Global objective function g(x)[cite: 164]."""
+#         if not joint_sequences: return 0.0
+#         total_reward = 0.0
+#         robot_ids = list(joint_sequences.keys())
+        
+#         for _ in range(self.n_samples):
+#             tiger_pos = random.randint(0, 1) # Hidden state Psi [cite: 399]
+#             sample_reward = 0.0
+#             for t in range(self.horizon):
+#                 actions = {rid: joint_sequences[rid][t] 
+#                            if t < len(joint_sequences[rid]) else LISTEN 
+#                            for rid in robot_ids}
+                
+#                 opened = False
+#                 for rid, act in actions.items():
+#                     if act == LISTEN: sample_reward -= 1
+#                     elif act == OPEN_LEFT:
+#                         opened = True
+#                         sample_reward += 10 if tiger_pos == 1 else -100
+#                     elif act == OPEN_RIGHT:
+#                         opened = True
+#                         sample_reward += 10 if tiger_pos == 0 else -100
+                
+#                 if opened: tiger_pos = random.randint(0, 1)
+#             total_reward += sample_reward
+            
+#         return total_reward / self.n_samples
+
+#     def local_utility_fn(self, robot_id, joint_sequences):
+#         """Local utility f^r = g(x) - g(x_phi)[cite: 201, 202]."""
+#         g_joint = self.g(joint_sequences)
+#         no_reward_seqs = joint_sequences.copy()
+#         no_reward_seqs[robot_id] = []
+#         return g_joint - self.g(no_reward_seqs)
+
+# # --- QMDP HEURISTIC PATCH ---
+# def qmdp_rollout(self, node):
+#     """
+#     Injected rollout policy: replaces random simulation with QMDP logic[cite: 114].
+#     It samples the hidden state and follows the MDP-optimal action.
+#     """
+#     state = node.state
+#     actions = []
+#     depth = node.depth if hasattr(node, 'depth') else 0
+    
+#     # Sample true state for this rollout simulation [cite: 274, 400]
+#     tiger_pos = random.randint(0, 1) 
+    
+#     while not state.is_terminal_state() and len(node.action_sequence) + len(actions) < state.max_horizon:
+#         # QMDP Heuristic: If I 'know' state, I take the optimal MDP action
+#         # Tiger Left (0) -> Open Right (2) | Tiger Right (1) -> Open Left (1)
+#         a = OPEN_RIGHT if tiger_pos == 0 else OPEN_LEFT
+#         actions.append(a)
+#         state = state.take_action(a)
+#     return actions
+
+# def run_benchmark():
+#     HORIZON = 8
+#     ROBOT_IDS = ['agent_1', 'agent_2']
+#     utility = TigerUtility(horizon=HORIZON, n_samples=50)
+
+#     print(f"--- SDEC-TIGER (Horizon {HORIZON}) WITH QMDP HEURISTIC ---", flush=True)
+    
+#     planners = {}
+#     for rid in ROBOT_IDS:
+#         init_state = TigerSearchState(max_horizon=HORIZON)
+#         def f_r(joint, rid=rid): return utility.local_utility_fn(rid, joint)
+
+#         planner = DecMCTS(
+#             robot_id=rid, robot_ids=ROBOT_IDS, init_state=init_state,
+#             local_utility_fn=f_r, Cp=0.5, tau=800, num_samples=1000, num_seq=10,
+#             gamma=0.95, beta_init=2.0, beta_decay=0.99, alpha=0.05
+#         )
+        
+#         # Monkey-patch: Replace random rollout with QMDP [cite: 271, 275]
+#         planner._rollout = qmdp_rollout.__get__(planner, DecMCTS)
+#         planners[rid] = planner
+
+#     team = DecMCTSTeam(planners)
+#     start_time = time.time()
+
+#     for n in range(41):
+#         team.iterate_and_communicate(n_outer=1)
+#         if n % 5 == 0:
+#             elapsed = time.time() - start_time
+#             print(f"Iter {n} | Time: {elapsed:.1f}s | Entropies: {team.entropies()}", flush=True)
+
+#     print("\n--- RESULTS ---", flush=True)
+#     best_plans = team.best_sequences()
+#     final_joint = {rid: list(plan) for rid, plan in best_plans.items()}
+    
+#     for rid, seq in final_joint.items():
+#         print(f"{rid} Plan: {seq}")
+    
+#     print("\n--- POLICY EXTRACTION ---", flush=True)
+#     for rid, planner in planners.items():
+#         print(f"\nTop 3 Plans for {rid}:")
+#         policy = planner.get_full_policy()
+#         for seq, prob in policy:
+#             print(f"  Prob {prob:.4f}: {list(seq)}")
+        
+#     print(f"\nFinal Expected Value: {utility.g(final_joint):.5f}")
+#     print(f"Target Value: 12.21726")
+
+# if __name__ == "__main__":
+#     run_benchmark()

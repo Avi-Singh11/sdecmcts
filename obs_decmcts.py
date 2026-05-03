@@ -267,11 +267,15 @@ class ObsDecMCTS:
     def get_distribution(self) -> Tuple[List[PolicyKey], Dict[PolicyKey, float]]:
         return list(self.X_hat), copy.copy(self.q)
 
-    def best_policy(self) -> PolicyTree:
-        if self.q:
-            best_key = max(self.q, key=self.q.get)
-            return PolicyTree.from_key(best_key, self.default_action_fn)
+    # def best_policy(self) -> PolicyTree:
+    #     if self.q:
+    #         best_key = max(self.q, key=self.q.get)
+    #         return PolicyTree.from_key(best_key, self.default_action_fn)
 
+    #     return self._greedy_policy_from_tree()
+
+    # REMOVE/CHECK
+    def best_policy(self) -> PolicyTree:
         return self._greedy_policy_from_tree()
 
     def _policy_from_forced_root_action(self, root_action: Action) -> PolicyTree:
@@ -305,15 +309,47 @@ class ObsDecMCTS:
 
         return None
 
-    def best_action(self, history: History = ()) -> Action:
+    # def best_action(self, history: History = ()) -> Action:
+    #     node = self._find_node_for_history(self.root, history)
+    #     if node is not None and node.actions:
+    #         return max(
+    #             node.actions.values(),
+    #             key=lambda e: e.q(),
+    #         ).action
+
+    #     return self.best_policy().action(history)
+
+    ## REMOVE/CHECK
+    def best_action(self, history: History = (), source: str = "tree") -> Action:
+        """
+        source:
+        - "tree": current behavior, choose argmax root/tree edge.q()
+        - "disc_tree": choose argmax discounted edge value
+        - "policy": choose action from best q-distribution policy
+        - "visits": choose most visited tree action
+        """
+        if source == "policy":
+            return self.best_policy().action(history)
+
         node = self._find_node_for_history(self.root, history)
+
         if node is not None and node.actions:
-            return max(
-                node.actions.values(),
-                key=lambda e: e.q(),
-            ).action
+            if source == "tree":
+                return max(node.actions.values(), key=lambda e: e.q()).action
+
+            if source == "disc_tree":
+                return max(node.actions.values(), key=lambda e: e.disc_q()).action
+
+            if source == "visits":
+                return max(node.actions.values(), key=lambda e: e.visits).action
+
+            raise ValueError(f"Unknown action source: {source}")
 
         return self.best_policy().action(history)
+
+    # def best_action(self, history: History = (), source: str = "tree") -> Action:
+    #     # return self.best_policy().action(history)
+    #     return max(node.actions.values(), key=lambda e: e.q()).action
 
     # ------------------------------------------------------------------
     # Tree growth
@@ -578,7 +614,8 @@ class ObsDecMCTS:
         else:
             q = 0.5
 
-        parent_count = max(node.visits, 1.0000001)
+        # parent_count = max(node.visits, 1.0000001)
+        parent_count = max(node.disc_visits, 1.0000001)
         bonus = self.cp * math.sqrt(math.log(parent_count) / edge.disc_visits)
         return q + bonus
 
@@ -711,31 +748,125 @@ class ObsDecMCTS:
     #         self.q = {key: 1.0 / len(new_X_hat) for key in new_X_hat}
     #         self.beta = self.beta_init
 
+    # def _update_sample_space(self) -> None:
+    #     """
+    #     Build one policy candidate per legal root action. REMOVE
+
+    #     Each candidate forces a different root action, then fills the rest of the
+    #     observation-conditioned policy greedily from the current tree.
+
+    #     This avoids max-sampled representative trajectories while preserving
+    #     non-root observation-conditioned policy structure.
+    #     """
+    #     if not self.root.actions:
+    #         return
+
+    #     new_X_hat: List[PolicyKey] = []
+    #     seen = set()
+
+    #     # for action in self.root.legal_actions:
+    #     #     policy = self._policy_from_forced_root_action(action)
+    #     #     key = policy.key()
+
+    #     #     if key in seen:
+    #     #         continue
+
+    #     #     new_X_hat.append(key)
+    #     #     seen.add(key)
+
+    #     # REMOVE
+    #     for action in self.root.legal_actions:
+    #         policy = self._policy_from_forced_root_action(action)
+    #         key = policy.key()
+
+    #         if key in seen:
+    #             continue
+
+    #         new_X_hat.append(key)
+    #         seen.add(key)
+
+    #         if len(new_X_hat) >= self.num_policies:
+    #             break
+
+    #             if not new_X_hat:
+    #                 return
+
+    #             if set(new_X_hat) != set(self.X_hat):
+    #                 self.X_hat = new_X_hat
+    #                 self.q = {key: 1.0 / len(new_X_hat) for key in new_X_hat}
+    #                 self.beta = self.beta_init
+        
+    #     # if set(new_X_hat) != set(self.X_hat):
+    #     #     old_mass_by_root = {}
+
+    #     #     for old_key, old_p in self.q.items():
+    #     #         root_a = self._root_action_of_key(old_key)
+    #     #         if root_a is not None:
+    #     #             old_mass_by_root[root_a] = old_mass_by_root.get(root_a, 0.0) + old_p
+
+    #     #     new_q = {}
+    #     #     for new_key in new_X_hat:
+    #     #         root_a = self._root_action_of_key(new_key)
+    #     #         if root_a is None:
+    #     #             new_q[new_key] = 1.0 / len(new_X_hat)
+    #     #         else:
+    #     #             new_q[new_key] = old_mass_by_root.get(root_a, 1.0 / len(new_X_hat))
+
+    #     #     self.X_hat = new_X_hat
+    #     #     self.q = self._normalize(new_q)
+
     def _update_sample_space(self) -> None:
         """
-        Build one policy candidate per legal root action. REMOVE
+        Generic sample-space update.
 
-        Each candidate forces a different root action, then fills the rest of the
-        observation-conditioned policy greedily from the current tree.
+        Candidate policies come from:
+        1. representative policies discovered during tree search
+        2. root-action-forced policies from explored root edges
 
-        This avoids max-sampled representative trajectories while preserving
-        non-root observation-conditioned policy structure.
+        We then rank all candidates by estimated/tree value and keep the top
+        self.num_policies. This avoids domain-specific behavior and avoids
+        arbitrary dependence on legal action ordering.
         """
-        if not self.root.actions:
-            return
+        candidate_scores: Dict[PolicyKey, float] = {}
 
-        new_X_hat: List[PolicyKey] = []
-        seen = set()
+        # 1. Representative policies from tree nodes.
+        nodes: List[ObsNode] = []
+        self._collect_nodes(self.root, nodes)
 
-        for action in self.root.legal_actions:
-            policy = self._policy_from_forced_root_action(action)
-            key = policy.key()
-
-            if key in seen:
+        for node in nodes:
+            key = node.representative_policy
+            if key is None:
                 continue
 
-            new_X_hat.append(key)
-            seen.add(key)
+            # Prefer discounted value because your current tree uses disc stats.
+            score = node.disc_q() if node.disc_visits > 0 else node.q()
+
+            if key not in candidate_scores or score > candidate_scores[key]:
+                candidate_scores[key] = score
+
+        # 2. Root-action-forced policies from explored root actions.
+        for edge in self.root.actions.values():
+            policy = self._policy_from_forced_root_action(edge.action)
+            key = policy.key()
+
+            score = edge.disc_q() if edge.disc_visits > 0 else edge.q()
+
+            if key not in candidate_scores or score > candidate_scores[key]:
+                candidate_scores[key] = score
+
+        if not candidate_scores:
+            return
+
+        ranked_keys = [
+            key
+            for key, _score in sorted(
+                candidate_scores.items(),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
+        ]
+
+        new_X_hat = ranked_keys[: self.num_policies]
 
         if not new_X_hat:
             return
@@ -744,6 +875,12 @@ class ObsDecMCTS:
             self.X_hat = new_X_hat
             self.q = {key: 1.0 / len(new_X_hat) for key in new_X_hat}
             self.beta = self.beta_init
+    
+    def _root_action_of_key(self, key: PolicyKey) -> Optional[Action]:
+        for hist, action in key:
+            if hist == ():
+                return action
+        return None
 
     def _update_distribution(self) -> None:
         if not self.X_hat:
@@ -951,11 +1088,24 @@ class ObsDecMCTSTeam:
             for rid, planner in self.planners.items()
         }
 
-    def best_actions(self, histories: Optional[Dict[RobotID, History]] = None) -> Dict[RobotID, Action]:
+    # def best_actions(self, histories: Optional[Dict[RobotID, History]] = None) -> Dict[RobotID, Action]:
+    #     histories = histories or {rid: () for rid in self.planners}
+
+    #     return {
+    #         rid: planner.best_action(histories.get(rid, ()))
+    #         for rid, planner in self.planners.items()
+    #     }
+
+    # REMOVE/CHANGE
+    def best_actions(
+        self,
+        histories: Optional[Dict[RobotID, History]] = None,
+        source: str = "tree",
+    ) -> Dict[RobotID, Action]:
         histories = histories or {rid: () for rid in self.planners}
 
         return {
-            rid: planner.best_action(histories.get(rid, ()))
+            rid: planner.best_action(histories.get(rid, ()), source=source)
             for rid, planner in self.planners.items()
         }
 
