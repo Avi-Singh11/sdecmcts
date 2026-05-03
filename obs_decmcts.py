@@ -267,15 +267,11 @@ class ObsDecMCTS:
     def get_distribution(self) -> Tuple[List[PolicyKey], Dict[PolicyKey, float]]:
         return list(self.X_hat), copy.copy(self.q)
 
-    # def best_policy(self) -> PolicyTree:
-    #     if self.q:
-    #         best_key = max(self.q, key=self.q.get)
-    #         return PolicyTree.from_key(best_key, self.default_action_fn)
-
-    #     return self._greedy_policy_from_tree()
-
-    # REMOVE/CHECK
     def best_policy(self) -> PolicyTree:
+        if self.q:
+            best_key = max(self.q, key=self.q.get)
+            return PolicyTree.from_key(best_key, self.default_action_fn)
+
         return self._greedy_policy_from_tree()
 
     def _policy_from_forced_root_action(self, root_action: Action) -> PolicyTree:
@@ -342,6 +338,21 @@ class ObsDecMCTS:
 
             if source == "visits":
                 return max(node.actions.values(), key=lambda e: e.visits).action
+            
+            if source == "policy_value":
+                return self.best_policy_by_value().action(history)
+
+            if source == "policy_marginal":
+                if not self.q:
+                    return self.best_policy().action(history)
+                
+                masses = {}
+                for key, p in self.q.items():
+                    policy = PolicyTree.from_key(key, self.default_action_fn)
+                    a = policy.action(history)
+                    masses[a] = masses.get(a, 0.0) + p
+
+                return max(masses, key=masses.get)
 
             raise ValueError(f"Unknown action source: {source}")
 
@@ -658,6 +669,16 @@ class ObsDecMCTS:
             state = step.next_state
 
         return total
+    
+    def best_policy_by_value(self) -> PolicyTree:
+        if not self.X_hat:
+            return self._greedy_policy_from_tree()
+
+        best_key = max(
+            self.X_hat,
+            key=lambda key: self._estimate_expectation(fixed_policy_key=key),
+        )
+        return PolicyTree.from_key(best_key, self.default_action_fn)
 
     # ------------------------------------------------------------------
     # Sparse policy distribution update
@@ -815,21 +836,123 @@ class ObsDecMCTS:
     #     #     self.X_hat = new_X_hat
     #     #     self.q = self._normalize(new_q)
 
+    # def _update_sample_space(self) -> None:
+    #     """
+    #     Generic sample-space update.
+
+    #     Candidate policies come from:
+    #     1. representative policies discovered during tree search
+    #     2. root-action-forced policies from explored root edges
+
+    #     We then rank all candidates by estimated/tree value and keep the top
+    #     self.num_policies. This avoids domain-specific behavior and avoids
+    #     arbitrary dependence on legal action ordering.
+    #     """
+    #     candidate_scores: Dict[PolicyKey, float] = {}
+
+    #     # 1. Representative policies from tree nodes.
+    #     nodes: List[ObsNode] = []
+    #     self._collect_nodes(self.root, nodes)
+
+    #     for node in nodes:
+    #         key = node.representative_policy
+    #         if key is None:
+    #             continue
+
+    #         # Prefer discounted value because your current tree uses disc stats.
+    #         score = node.disc_q() if node.disc_visits > 0 else node.q()
+
+    #         if key not in candidate_scores or score > candidate_scores[key]:
+    #             candidate_scores[key] = score
+
+    #     # 2. Root-action-forced policies from explored root actions.
+    #     for edge in self.root.actions.values():
+    #         policy = self._policy_from_forced_root_action(edge.action)
+    #         key = policy.key()
+
+    #         score = edge.disc_q() if edge.disc_visits > 0 else edge.q()
+
+    #         if key not in candidate_scores or score > candidate_scores[key]:
+    #             candidate_scores[key] = score
+
+    #     if not candidate_scores:
+    #         return
+
+    #     ranked_keys = [
+    #         key
+    #         for key, _score in sorted(
+    #             candidate_scores.items(),
+    #             key=lambda kv: kv[1],
+    #             reverse=True,
+    #         )
+    #     ]
+
+    #     new_X_hat = ranked_keys[: self.num_policies]
+
+    #     if not new_X_hat:
+    #         return
+
+    #     if set(new_X_hat) != set(self.X_hat):
+    #         self.X_hat = new_X_hat
+    #         self.q = {key: 1.0 / len(new_X_hat) for key in new_X_hat}
+    #         self.beta = self.beta_init
+
+    def _replace_sample_space_preserve_q(self, new_X_hat: List[PolicyKey]) -> None:
+        if not new_X_hat:
+            return
+
+        old_q = self.q
+        old_support = set(self.X_hat)
+        new_support = set(new_X_hat)
+
+        # If support is unchanged, preserve q exactly.
+        if new_support == old_support:
+            self.X_hat = new_X_hat
+            self.q = self._normalize({
+                key: old_q.get(key, 0.0)
+                for key in new_X_hat
+            })
+            return
+
+        # Preserve probability for policies that survive.
+        eps = 1e-3
+        new_q = {}
+
+        for key in new_X_hat:
+            if key in old_q:
+                new_q[key] = old_q[key]
+            else:
+                # Small prior for newly discovered policies.
+                new_q[key] = eps
+
+        self.X_hat = new_X_hat
+        self.q = self._normalize(new_q)
+
+        # Do not reset beta every time; changing support is normal.
+        # self.beta = self.beta_init
+    
+    # CHECK REMOVE
+    def _score_policy_key(self, key: PolicyKey, n_eval: int = 5) -> float:
+        total = 0.0
+
+        for _ in range(n_eval):
+            own_policy = PolicyTree.from_key(key, self.default_action_fn)
+            other_policies = self._sample_other_policies()
+            state = self.model.sample_state_from_belief(self.root_belief, self.rng)
+
+            total += self._eval_joint_policies(
+                state=state,
+                own_policy=own_policy,
+                other_policies=other_policies,
+            )
+
+        return total / n_eval
+    ##
+
     def _update_sample_space(self) -> None:
-        """
-        Generic sample-space update.
-
-        Candidate policies come from:
-        1. representative policies discovered during tree search
-        2. root-action-forced policies from explored root edges
-
-        We then rank all candidates by estimated/tree value and keep the top
-        self.num_policies. This avoids domain-specific behavior and avoids
-        arbitrary dependence on legal action ordering.
-        """
         candidate_scores: Dict[PolicyKey, float] = {}
 
-        # 1. Representative policies from tree nodes.
+        # Representative policies from tree nodes.
         nodes: List[ObsNode] = []
         self._collect_nodes(self.root, nodes)
 
@@ -838,18 +961,17 @@ class ObsDecMCTS:
             if key is None:
                 continue
 
-            # Prefer discounted value because your current tree uses disc stats.
             score = node.disc_q() if node.disc_visits > 0 else node.q()
-
             if key not in candidate_scores or score > candidate_scores[key]:
                 candidate_scores[key] = score
 
-        # 2. Root-action-forced policies from explored root actions.
+        # Root-action-forced policies from explored root actions.
+        root_forced: List[Tuple[PolicyKey, float]] = []
         for edge in self.root.actions.values():
             policy = self._policy_from_forced_root_action(edge.action)
             key = policy.key()
-
-            score = edge.disc_q() if edge.disc_visits > 0 else edge.q()
+            score = edge.q()  # use ordinary q for now; simpler and matches final tree values
+            root_forced.append((key, score))
 
             if key not in candidate_scores or score > candidate_scores[key]:
                 candidate_scores[key] = score
@@ -857,6 +979,20 @@ class ObsDecMCTS:
         if not candidate_scores:
             return
 
+        # 1. Always keep one policy per root action, ranked by root edge value.
+        new_X_hat: List[PolicyKey] = []
+        seen = set()
+
+        for key, _score in sorted(root_forced, key=lambda kv: kv[1], reverse=True):
+            if key in seen:
+                continue
+            new_X_hat.append(key)
+            seen.add(key)
+
+            if len(new_X_hat) >= self.num_policies:
+                break
+
+        # 2. Fill remaining slots with other high-scoring candidates.
         ranked_keys = [
             key
             for key, _score in sorted(
@@ -866,15 +1002,35 @@ class ObsDecMCTS:
             )
         ]
 
-        new_X_hat = ranked_keys[: self.num_policies]
+        for key in ranked_keys:
+            if key in seen:
+                continue
+            new_X_hat.append(key)
+            seen.add(key)
+
+            if len(new_X_hat) >= self.num_policies:
+                break
 
         if not new_X_hat:
             return
+        
+        ## CHECK REMOVE
+        scored = [
+            (key, self._score_policy_key(key, n_eval=max(1, self.num_samples)))
+            for key in candidate_scores.keys()
+        ]
 
-        if set(new_X_hat) != set(self.X_hat):
-            self.X_hat = new_X_hat
-            self.q = {key: 1.0 / len(new_X_hat) for key in new_X_hat}
-            self.beta = self.beta_init
+        scored.sort(key=lambda kv: kv[1], reverse=True)
+        new_X_hat = [key for key, _score in scored[: self.num_policies]]
+        self._replace_sample_space_preserve_q(new_X_hat)
+
+        # if set(new_X_hat) != set(self.X_hat):
+        #     self.X_hat = new_X_hat
+        #     self.q = {key: 1.0 / len(new_X_hat) for key in new_X_hat}
+        #     self.beta = self.beta_init
+        ##
+
+        self._replace_sample_space_preserve_q(new_X_hat)
     
     def _root_action_of_key(self, key: PolicyKey) -> Optional[Action]:
         for hist, action in key:

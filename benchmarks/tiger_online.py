@@ -818,7 +818,7 @@ def run_obs_planning_step(
     policies = team.best_policies()
 
     for rid in range(N_AGENTS):
-        raw_a = int(planners[rid].best_action(history=()))
+        raw_a = int(planners[rid].best_action(history=(), source="policy"))
         raw_actions[rid] = raw_a
 
         if getattr(args, "guard_actions", False):
@@ -1155,10 +1155,6 @@ def main() -> None:
     parser.add_argument("--local-utility", choices=["difference", "global"], default="difference")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--verbose-first", action="store_true")
-    parser.add_argument("--guard-actions", action="store_true", help="Veto OPEN actions when belief confidence is below open_threshold.")
-
-    parser.add_argument("--force-open-when-confident", action="store_true", help="With --guard-actions, open the safe-looking door whenever belief is confident.")
-
     parser.add_argument("--env-comm-mode", choices=["periodic", "both-listen", "none"], default="periodic", help="Execution-time observation sharing mode.")
     parser.add_argument("--diverse-sample-space", action="store_true")
     parser.add_argument("--planner", choices=["open-loop", "obs"], default="open-loop", help="Planner backend: vanilla open-loop DecMCTS or observation-conditioned ObsDecMCTS.")
