@@ -15,6 +15,9 @@ Execution remains online/receding-horizon:
     update belief
     replan
 
+For decentralized RS-MAA* comparisons, agents keep private beliefs during
+execution. Set --env-comm-period > 0 only for explicit communication ablations.
+
 Domain:
   - 2 agents:
         agent 0 = helicopter
@@ -52,6 +55,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from obs_decmcts import ObsDecMCTS, ObsDecMCTSTeam, StepResult, PolicyTree
+from belief_obs_decmcts import BeliefObsDecMCTS, BeliefObsDecMCTSTeam, BeliefPolicyTree, rounded_belief_key
 
 
 # =============================================================================
@@ -101,6 +105,26 @@ PICKUP_REWARD = 5.0
 DROPOFF_REWARD = 12.0
 PICKUP_MISMATCH_PENALTY = -6.0
 DROPOFF_MISMATCH_PENALTY = -6.0
+
+# Paper reference values for Maritime MEDEVAC. These are expected finite-horizon
+# values, so comparison runs should use --gamma 1.0 and many episodes.
+REFERENCE_DECENTRALIZED_RSMAA = {
+    5: 3.46,
+    6: 3.18348,
+    7: 3.26710,
+    8: 8.03228,
+    9: 10.79,
+    10: 12.15,
+}
+
+REFERENCE_CENTRALIZED_RSSDA = {
+    5: 3.50,
+    6: 3.19945,
+    7: 6.61819,
+    8: 10.88244,
+    9: 13.01,
+    10: 13.61,
+}
 
 
 # =============================================================================
@@ -431,6 +455,21 @@ class MedevacObsModelAdapter:
     def joint_action_from_dict(self, actions: Dict[int, int]) -> int:
         return self.model.joint_action(actions[0], actions[1])
 
+    def update_belief(
+        self,
+        belief: Sequence[float],
+        joint_action: int,
+        local_obs: int,
+        robot_id: int,
+    ) -> List[float]:
+        return update_local_belief(
+            belief=belief,
+            joint_a=joint_action,
+            local_obs=local_obs,
+            rid=robot_id,
+            model=self.model,
+        )
+
 
 # =============================================================================
 # Belief updates
@@ -618,26 +657,34 @@ def maybe_guard_exchange(
 
     return ADVANCE
 
-# def make_medevac_legal_actions_fn(root_belief, rid, exchange_threshold):
-#     def legal_actions(history, depth):
-#         # Root of online replanning: use current belief.
-#         if history == ():
-#             p_ready = belief_prob_agent_at_target(root_belief, rid)
+def make_medevac_legal_actions_fn(
+    root_belief,
+    rid,
+    exchange_threshold,
+    full_action_space: bool = False,
+):
+    def legal_actions(history, depth):
+        if full_action_space:
+            return [WAIT, ADVANCE, EXCHANGE]
 
-#             if p_ready >= exchange_threshold:
-#                 return [EXCHANGE, WAIT]
+        # Root of online replanning: use current belief.
+        if history == ():
+            p_ready = belief_prob_agent_at_target(root_belief, rid)
 
-#             return [ADVANCE, WAIT]
+            if p_ready >= exchange_threshold:
+                return [EXCHANGE, WAIT]
 
-#         # Non-root policy-tree histories: use last local observation.
-#         _last_action, last_obs = history[-1]
+            return [ADVANCE]
 
-#         if last_obs == AT_TARGET:
-#             return [EXCHANGE, WAIT]
+        # Non-root policy-tree histories: use last local observation.
+        _last_action, last_obs = history[-1]
 
-#         return [ADVANCE, WAIT]
+        if last_obs == AT_TARGET:
+            return [EXCHANGE, WAIT]
 
-#     return legal_actions
+        return [ADVANCE]
+
+    return legal_actions
 
 def make_medevac_default_action_fn(root_belief, rid, exchange_threshold):
     def default_action(history):
@@ -653,6 +700,59 @@ def make_medevac_default_action_fn(root_belief, rid, exchange_threshold):
         return ADVANCE
 
     return default_action
+
+
+def make_medevac_belief_legal_actions_fn(
+    rid,
+    exchange_threshold,
+    full_action_space: bool = False,
+):
+    def legal_actions(belief, depth):
+        if full_action_space:
+            return [WAIT, ADVANCE, EXCHANGE]
+
+        p_ready = belief_prob_agent_at_target(belief, rid)
+        if p_ready >= exchange_threshold:
+            return [EXCHANGE, WAIT]
+        return [ADVANCE]
+
+    return legal_actions
+
+
+def make_medevac_belief_default_action_fn(rid, exchange_threshold):
+    def default_action(belief):
+        p_ready = belief_prob_agent_at_target(belief, rid)
+        if p_ready >= exchange_threshold:
+            return EXCHANGE
+        return ADVANCE
+
+    return default_action
+
+
+def belief_obs_root_action_masses(planner: BeliefObsDecMCTS) -> Dict[str, float]:
+    masses = {
+        WAIT: 0.0,
+        ADVANCE: 0.0,
+        EXCHANGE: 0.0,
+    }
+    root_key = (0, rounded_belief_key(planner.root_belief))
+
+    for policy_key, p in planner.q.items():
+        policy = BeliefPolicyTree.from_key(
+            policy_key,
+            planner.default_action_fn,
+            planner.belief_lookup,
+        )
+        try:
+            root_a = policy.action(planner.root_belief, root_key)
+            masses[root_a] += p
+        except Exception:
+            pass
+
+    return {
+        ACTION_NAME[a]: round(masses[a], 4)
+        for a in [WAIT, ADVANCE, EXCHANGE]
+    }
 
 ## ABLATION
 # def make_medevac_default_action_fn(legal_actions_fn, rng, root):
@@ -683,15 +783,27 @@ def run_obs_planning_step(
 ):
     planners: Dict[int, ObsDecMCTS] = {}
     adapter = MedevacObsModelAdapter(model)
+    default_action_fns_by_robot = {
+        rid: make_medevac_default_action_fn(
+            root_belief=beliefs[rid],
+            rid=rid,
+            exchange_threshold=args.exchange_threshold,
+        )
+        for rid in range(N_AGENTS)
+    }
 
     for rid in range(N_AGENTS):
-        default_rng = random.Random(seed + 2003 * rid)
         planners[rid] = ObsDecMCTS(
             robot_id=rid,
             robot_ids=[0, 1],
             root_belief=beliefs[rid],
             model=adapter,
-            legal_actions_fn=medevac_legal_actions_from_history,
+            legal_actions_fn=make_medevac_legal_actions_fn(
+                root_belief=beliefs[rid],
+                rid=rid,
+                exchange_threshold=args.exchange_threshold,
+                full_action_space=args.full_action_space,
+            ),
             # default_action_fn=medevac_default_action_from_history,
             # legal_actions_fn=make_medevac_legal_actions_fn(
             #     root_belief=beliefs[rid],
@@ -711,11 +823,8 @@ def run_obs_planning_step(
             # ),      
             ##
 
-            default_action_fn=make_medevac_default_action_fn(
-                root_belief=beliefs[rid],
-                rid=rid,
-                exchange_threshold=args.exchange_threshold,
-            ),
+            default_action_fn=default_action_fns_by_robot[rid],
+            default_action_fns_by_robot=default_action_fns_by_robot,
             gamma=args.gamma,
             cp=args.cp,
             horizon=remaining_horizon,
@@ -787,6 +896,87 @@ def run_obs_planning_step(
     return actions, raw_actions, policies, team.entropies(), root_masses, debug_actions
 
 
+def run_belief_obs_planning_step(
+    beliefs: Dict[int, List[float]],
+    remaining_horizon: int,
+    model: MedevacModel,
+    args,
+    seed: int,
+):
+    planners: Dict[int, BeliefObsDecMCTS] = {}
+    adapter = MedevacObsModelAdapter(model)
+    default_action_fns_by_robot = {
+        rid: make_medevac_belief_default_action_fn(
+            rid=rid,
+            exchange_threshold=args.exchange_threshold,
+        )
+        for rid in range(N_AGENTS)
+    }
+
+    for rid in range(N_AGENTS):
+        planners[rid] = BeliefObsDecMCTS(
+            robot_id=rid,
+            robot_ids=[0, 1],
+            root_belief=beliefs[rid],
+            root_beliefs_by_robot=beliefs,
+            model=adapter,
+            legal_actions_fn=make_medevac_belief_legal_actions_fn(
+                rid=rid,
+                exchange_threshold=args.exchange_threshold,
+                full_action_space=args.full_action_space,
+            ),
+            default_action_fn=default_action_fns_by_robot[rid],
+            default_action_fns_by_robot=default_action_fns_by_robot,
+            share_belief_nodes=args.belief_share_nodes,
+            gamma=args.gamma,
+            cp=args.cp,
+            horizon=remaining_horizon,
+            tau=args.tau,
+            num_policies=args.num_seq,
+            num_samples=args.num_samples,
+            beta_init=args.beta_init,
+            beta_decay=args.beta_decay,
+            alpha=args.alpha,
+            seed=seed + 1009 * rid,
+        )
+
+    team = BeliefObsDecMCTSTeam(planners)
+    team.iterate_and_communicate(
+        n_outer=args.outer_iters,
+        comm_period=args.comm_period,
+    )
+
+    policies = team.best_policies()
+    raw_actions = team.best_actions(beliefs=beliefs, source=args.action_source)
+
+    debug_actions = {
+        "tree": team.best_actions(beliefs=beliefs, source="tree"),
+        "disc_tree": team.best_actions(beliefs=beliefs, source="disc_tree"),
+        "policy": team.best_actions(beliefs=beliefs, source="policy"),
+        "visits": team.best_actions(beliefs=beliefs, source="visits"),
+    }
+
+    actions = {}
+    for rid in range(N_AGENTS):
+        raw_a = int(raw_actions[rid])
+        if getattr(args, "guard_actions", False):
+            actions[rid] = maybe_guard_exchange(
+                belief=beliefs[rid],
+                rid=rid,
+                proposed_action=raw_a,
+                exchange_threshold=args.exchange_threshold,
+            )
+        else:
+            actions[rid] = raw_a
+
+    root_masses = {
+        rid: belief_obs_root_action_masses(planner)
+        for rid, planner in planners.items()
+    }
+
+    return actions, raw_actions, policies, team.entropies(), root_masses, debug_actions
+
+
 # =============================================================================
 # Episode simulation
 # =============================================================================
@@ -808,8 +998,23 @@ def simulate_online_episode(
     common_belief = list(model.init_belief)
     pending_history: List[Tuple[int, int]] = []
 
+    def flush_pending_common_belief() -> None:
+        nonlocal common_belief, pending_history
+
+        for hist_joint_a, hist_joint_o in pending_history:
+            common_belief = update_joint_belief(
+                common_belief,
+                hist_joint_a,
+                hist_joint_o,
+                model,
+            )
+
+        beliefs[0] = list(common_belief)
+        beliefs[1] = list(common_belief)
+        pending_history = []
+
     total_reward = 0.0
-    discount = 0.95
+    discount = 1.0
 
     episode_counts = {
         "pickup_exchange": 0,
@@ -825,15 +1030,24 @@ def simulate_online_episode(
         remaining = args.horizon - t
 
         if verbose:
-            print(f"DEBUG entering t={t}, remaining={remaining}, planner=obs")
+            print(f"DEBUG entering t={t}, remaining={remaining}, planner={args.planner}")
 
-        actions, raw_actions, policies, entropies, root_masses, debug_actions = run_obs_planning_step(
-            beliefs=beliefs,
-            remaining_horizon=remaining,
-            model=model,
-            args=args,
-            seed=episode_seed + 7919 * t,
-        )
+        if args.planner == "belief-obs":
+            actions, raw_actions, policies, entropies, root_masses, debug_actions = run_belief_obs_planning_step(
+                beliefs=beliefs,
+                remaining_horizon=remaining,
+                model=model,
+                args=args,
+                seed=episode_seed + 7919 * t,
+            )
+        else:
+            actions, raw_actions, policies, entropies, root_masses, debug_actions = run_obs_planning_step(
+                beliefs=beliefs,
+                remaining_horizon=remaining,
+                model=model,
+                args=args,
+                seed=episode_seed + 7919 * t,
+            )
 
         a0, a1 = int(actions[0]), int(actions[1])
         joint_a = model.joint_action(a0, a1)
@@ -882,18 +1096,15 @@ def simulate_online_episode(
 
         pending_history.append((joint_a, joint_o))
 
-        if args.env_comm_period > 0 and (t + 1) % args.env_comm_period == 0:
-            for hist_joint_a, hist_joint_o in pending_history:
-                common_belief = update_joint_belief(
-                    common_belief,
-                    hist_joint_a,
-                    hist_joint_o,
-                    model,
-                )
-
-            beliefs[0] = list(common_belief)
-            beliefs[1] = list(common_belief)
-            pending_history = []
+        if args.env_comm_mode == "periodic":
+            if args.env_comm_period > 0 and (t + 1) % args.env_comm_period == 0:
+                flush_pending_common_belief()
+        elif args.env_comm_mode == "collocated":
+            next_hx, next_hy, next_sx, next_sy, _ = id_to_state(next_state)
+            if next_hx == next_sx and next_hy == next_sy:
+                flush_pending_common_belief()
+        else:
+            raise ValueError(f"Unknown env_comm_mode: {args.env_comm_mode}")
 
         if verbose:
             print(
@@ -921,8 +1132,14 @@ def simulate_online_episode(
             print(f"    belief0={belief_support_summary(beliefs[0])}")
             print(f"    belief1={belief_support_summary(beliefs[1])}")
             print(f"    root_mass={root_masses}")
-            print(f"    policy0_root_from_q={ACTION_NAME[policies[0].action(())]}")
-            print(f"    policy1_root_from_q={ACTION_NAME[policies[1].action(())]}")
+            if args.planner == "belief-obs":
+                key0 = (0, rounded_belief_key(beliefs[0]))
+                key1 = (0, rounded_belief_key(beliefs[1]))
+                print(f"    policy0_root_from_q={ACTION_NAME[policies[0].action(beliefs[0], key0)]}")
+                print(f"    policy1_root_from_q={ACTION_NAME[policies[1].action(beliefs[1], key1)]}")
+            else:
+                print(f"    policy0_root_from_q={ACTION_NAME[policies[0].action(())]}")
+                print(f"    policy1_root_from_q={ACTION_NAME[policies[1].action(())]}")
             print(f"    executed0_from_{args.action_source}={ACTION_NAME[int(raw_actions[0])]}")
             print(f"    executed1_from_{args.action_source}={ACTION_NAME[int(raw_actions[1])]}")
 
@@ -989,28 +1206,56 @@ def main() -> None:
 
     parser.add_argument("--outer-iters", type=int, default=30)
     parser.add_argument("--tau", type=int, default=40)
-    parser.add_argument("--num-seq", type=int, default=3)
+    parser.add_argument("--num-seq", type=int, default=30)
     parser.add_argument("--num-samples", type=int, default=30)
     parser.add_argument("--comm-period", type=int, default=1)
-    parser.add_argument("--env-comm-period", type=int, default=1)
+    parser.add_argument(
+        "--env-comm-mode",
+        choices=["periodic", "collocated"],
+        default="periodic",
+        help="Execution-time belief sync rule: fixed period or only when agents are collocated.",
+    )
+    parser.add_argument(
+        "--env-comm-period",
+        type=int,
+        default=0,
+        help="Execution-time observation sharing period for --env-comm-mode periodic. Use 0 for no execution sync.",
+    )
 
-    parser.add_argument("--gamma", type=float, default=0.95)
+    parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--cp", type=float, default=0.5)
     parser.add_argument("--beta-init", type=float, default=2.0)
     parser.add_argument("--beta-decay", type=float, default=0.995)
     parser.add_argument("--alpha", type=float, default=0.2)
+    parser.add_argument("--progressive-widening-visits", type=int, default=0)
 
     parser.add_argument("--exchange-threshold", type=float, default=0.80)
     parser.add_argument("--guard-actions", action="store_true")
+    parser.add_argument(
+        "--full-action-space",
+        action="store_true",
+        help="Allow WAIT, ADVANCE, and EXCHANGE at every MEDEVAC history.",
+    )
     parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--verbose-first", action="store_true")
     parser.add_argument("--debug-obs", action="store_true")
+    parser.add_argument(
+        "--planner",
+        choices=["obs", "belief-obs"],
+        default="obs",
+        help="Planner backend: history-conditioned ObsDecMCTS or belief-node ObsDecMCTS.",
+    )
+    parser.add_argument(
+        "--belief-share-nodes",
+        action="store_true",
+        help="Reuse belief nodes at the same depth when --planner belief-obs.",
+    )
     # REMOVE
     parser.add_argument(
         "--action-source",
         choices=["tree", "disc_tree", "policy", "visits", "policy_value", "policy_marginal"],
-        default="policy",
+        default="policy_marginal",
     )
 
     parser.add_argument(
@@ -1031,10 +1276,23 @@ def main() -> None:
     )
     print(
         f"exchange_threshold={args.exchange_threshold}, "
+        f"env_comm_mode={args.env_comm_mode}, "
         f"env_comm_period={args.env_comm_period}, "
+        f"full_action_space={args.full_action_space}, "
         f"guard_actions={args.guard_actions}, "
+        f"planner={args.planner}, "
         f"seed={args.seed}"
     )
+    if args.env_comm_mode == "collocated" or args.env_comm_period != 0:
+        print(
+            "WARNING: execution-time communication shares joint observations; "
+            "this is not a pure decentralized RS-MAA* comparison."
+        )
+    if abs(args.gamma - 1.0) > 1e-12:
+        print(
+            "WARNING: gamma != 1.0; paper reference values are undiscounted "
+            "finite-horizon expected values."
+        )
     print()
 
     returns: List[float] = []
@@ -1089,6 +1347,26 @@ def main() -> None:
     mean, ci = confidence_interval_95(returns)
     print()
     print(f"Final mean return: {mean:.5f} ± {ci:.5f} (95% CI)")
+
+    lower_ref = REFERENCE_DECENTRALIZED_RSMAA.get(args.horizon)
+    upper_ref = REFERENCE_CENTRALIZED_RSSDA.get(args.horizon)
+    if lower_ref is not None or upper_ref is not None:
+        print("Reference values:")
+        if lower_ref is not None:
+            print(f"  Decentralized RS-MAA*: {lower_ref:.5f}")
+        if upper_ref is not None:
+            print(f"  Centralized RSSDA* upper bound: {upper_ref:.5f}")
+
+            if mean > upper_ref + 1e-9:
+                print(
+                    "WARNING: sample mean exceeds the centralized RSSDA* upper bound. "
+                    "Check communication settings, gamma, reward timing, and Monte Carlo variance."
+                )
+            if mean - ci > upper_ref + 1e-9:
+                print(
+                    "WARNING: the 95% CI lower edge exceeds the upper bound; "
+                    "this strongly suggests a benchmark mismatch."
+                )
 
 
 if __name__ == "__main__":
