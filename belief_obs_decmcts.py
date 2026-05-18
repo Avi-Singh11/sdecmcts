@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import math
 import random
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Hashable, List, Optional, Sequence, Tuple
 
@@ -16,6 +17,30 @@ RobotID = Hashable
 State = Any
 
 PolicyKey = Tuple[Tuple[NodeKey, Action], ...]
+
+_PROFILER: Any = None
+
+
+def set_profiler(profiler: Any) -> None:
+    """Register an optional profiler with add(name, elapsed, count=1)."""
+    global _PROFILER
+    _PROFILER = profiler
+
+
+def _profiled_method(label: str, fn: Callable) -> Callable:
+    def wrapped(self, *args, **kwargs):
+        profiler = _PROFILER
+        if profiler is None:
+            return fn(self, *args, **kwargs)
+        t0 = time.perf_counter()
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            profiler.add(label, time.perf_counter() - t0)
+
+    wrapped.__name__ = getattr(fn, "__name__", "wrapped")
+    wrapped.__doc__ = getattr(fn, "__doc__", None)
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -216,6 +241,7 @@ class BeliefObsDecMCTS:
             Tuple[RobotID, BeliefKey, Any, Observation],
             Tuple[List[float], BeliefKey],
         ] = {}
+        self.belief_obj_key_cache: Dict[int, Tuple[Belief, BeliefKey]] = {}
         root_key = self._belief_key(self.root_belief)
         self.root = BeliefNode(
             belief=self.root_belief,
@@ -236,8 +262,13 @@ class BeliefObsDecMCTS:
         self.max_reward = float("-inf")
 
     def _belief_key(self, belief: Belief) -> BeliefKey:
+        obj_id = id(belief)
+        cached = self.belief_obj_key_cache.get(obj_id)
+        if cached is not None and cached[0] is belief:
+            return cached[1]
         key = self.belief_key_fn(belief)
         self.belief_lookup[key] = list(belief)
+        self.belief_obj_key_cache[obj_id] = (belief, key)
         return key
 
     def _default_action_fn_for_robot(
@@ -827,3 +858,57 @@ class BeliefObsDecMCTSTeam:
             rid: -sum(p * math.log(p) for p in planner.q.values() if p > 0)
             for rid, planner in self.planners.items()
         }
+
+
+def _install_core_profiling_wrappers() -> None:
+    planner_methods = [
+        "iterate",
+        "best_policy",
+        "best_action",
+        "_policy_from_forced_root_action",
+        "_grow_tree_once",
+        "_simulate_from_node",
+        "_select_or_expand_action",
+        "_rollout",
+        "_score_policy_key",
+        "_update_sample_space",
+        "_update_distribution",
+        "_estimate_expectation",
+        "_eval_joint_policies",
+        "_sample_own_policy",
+        "_sample_other_policies",
+        "_sample_from_dist",
+        "_greedy_policy_from_tree",
+        "_fill_greedy_policy",
+        "_collect_nodes",
+        "_collect_edges",
+        "_update_belief_cached",
+        "_get_or_create_node",
+        "_belief_key",
+    ]
+    for name in planner_methods:
+        fn = getattr(BeliefObsDecMCTS, name, None)
+        if fn is not None:
+            setattr(
+                BeliefObsDecMCTS,
+                name,
+                _profiled_method(f"belief_core.BeliefObsDecMCTS.{name}", fn),
+            )
+
+    team_methods = [
+        "iterate_and_communicate",
+        "best_policies",
+        "best_actions",
+        "entropies",
+    ]
+    for name in team_methods:
+        fn = getattr(BeliefObsDecMCTSTeam, name, None)
+        if fn is not None:
+            setattr(
+                BeliefObsDecMCTSTeam,
+                name,
+                _profiled_method(f"belief_core.BeliefObsDecMCTSTeam.{name}", fn),
+            )
+
+
+_install_core_profiling_wrappers()

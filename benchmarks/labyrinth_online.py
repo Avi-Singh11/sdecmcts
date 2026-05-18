@@ -32,6 +32,8 @@ REPO_ROOT = PROJECT_ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import obs_decmcts as obs_core
+import belief_obs_decmcts as belief_core
 from obs_decmcts import ObsDecMCTS, ObsDecMCTSTeam, StepResult
 from belief_obs_decmcts import BeliefObsDecMCTS, BeliefObsDecMCTSTeam
 
@@ -393,7 +395,13 @@ class LabyrinthModel:
                     p = float(parts[6])
                     a = joint_action(a0, a1, self.act_per_agent)
                     o = joint_obs(o0, o1, self.obs_per_agent)
-                    flat_o[(a, sp, o)] = flat_o.get((a, sp, o), 0.0) + p
+                    key = (a, sp, o)
+                    old_p = flat_o.get(key)
+                    if old_p is not None and abs(old_p - p) > 1e-12:
+                        raise ValueError(
+                            f"Inconsistent duplicate observation entry {key}: {old_p} vs {p}"
+                        )
+                    flat_o[key] = p
 
         flat_t = self._redirect_goal_transitions(flat_t, self.rewards)
         flat_t = self._apply_sync_knowledge_propagation(flat_t, self.rewards)
@@ -542,13 +550,20 @@ def predict_belief_open_loop(
     action: int,
     model: LabyrinthModel,
 ) -> List[float]:
-    out = [0.0] * model.n_states
-    for s, b_s in enumerate(belief):
-        if b_s <= 0.0:
-            continue
+    accum: Dict[int, float] = {}
+    for s, b_s in belief_support(belief):
         for sp, p in model.transition_dist(s, action):
-            out[sp] += b_s * p
-    return normalize_belief(out)
+            accum[sp] = accum.get(sp, 0.0) + b_s * p
+
+    total = sum(accum.values())
+    if total <= 1e-15:
+        return normalize_belief([0.0] * model.n_states)
+
+    out = [0.0] * model.n_states
+    inv_total = 1.0 / total
+    for sp, p in accum.items():
+        out[sp] = p * inv_total
+    return out
 
 
 def update_local_belief(
@@ -558,12 +573,30 @@ def update_local_belief(
     rid: int,
     model: LabyrinthModel,
 ) -> List[float]:
-    pred = predict_belief_open_loop(belief, action, model)
-    post = [
-        pred[sp] * model.local_obs_prob(rid, sp, action, local_obs)
-        for sp in range(model.n_states)
-    ]
-    return normalize_belief(post, [s for s, p in enumerate(pred) if p > 0.0])
+    pred_accum: Dict[int, float] = {}
+    for s, b_s in belief_support(belief):
+        for sp, p in model.transition_dist(s, action):
+            pred_accum[sp] = pred_accum.get(sp, 0.0) + b_s * p
+
+    post_accum: Dict[int, float] = {}
+    for sp, pred_p in pred_accum.items():
+        obs_p = model.local_obs_prob(rid, sp, action, local_obs)
+        if obs_p > 0.0:
+            post_accum[sp] = pred_p * obs_p
+
+    out = [0.0] * model.n_states
+    total = sum(post_accum.values())
+    if total > 1e-15:
+        inv_total = 1.0 / total
+        for sp, p in post_accum.items():
+            out[sp] = p * inv_total
+        return out
+
+    support = list(pred_accum.keys())
+    p = 1.0 / max(1, len(support))
+    for sp in support:
+        out[sp] = p
+    return out
 
 
 def update_joint_belief(
@@ -572,12 +605,30 @@ def update_joint_belief(
     obs: int,
     model: LabyrinthModel,
 ) -> List[float]:
-    pred = predict_belief_open_loop(belief, action, model)
-    post = [
-        pred[sp] * model.obs_prob(sp, action, obs)
-        for sp in range(model.n_states)
-    ]
-    return normalize_belief(post, [s for s, p in enumerate(pred) if p > 0.0])
+    pred_accum: Dict[int, float] = {}
+    for s, b_s in belief_support(belief):
+        for sp, p in model.transition_dist(s, action):
+            pred_accum[sp] = pred_accum.get(sp, 0.0) + b_s * p
+
+    post_accum: Dict[int, float] = {}
+    for sp, pred_p in pred_accum.items():
+        obs_p = model.obs_prob(sp, action, obs)
+        if obs_p > 0.0:
+            post_accum[sp] = pred_p * obs_p
+
+    out = [0.0] * model.n_states
+    total = sum(post_accum.values())
+    if total > 1e-15:
+        inv_total = 1.0 / total
+        for sp, p in post_accum.items():
+            out[sp] = p * inv_total
+        return out
+
+    support = list(pred_accum.keys())
+    p = 1.0 / max(1, len(support))
+    for sp in support:
+        out[sp] = p
+    return out
 
 
 def average_belief(beliefs: Dict[int, Sequence[float]], n_states: int) -> List[float]:
@@ -590,6 +641,18 @@ def average_belief(beliefs: Dict[int, Sequence[float]], n_states: int) -> List[f
 
 def belief_support(belief: Sequence[float]) -> List[Tuple[int, float]]:
     return [(s, float(p)) for s, p in enumerate(belief) if p > 1e-12]
+
+
+def sparse_rounded_belief_key(
+    belief: Sequence[float],
+    ndigits: int = 12,
+    threshold: float = 1e-12,
+) -> Tuple[Tuple[int, float], ...]:
+    return tuple(
+        (idx, round(float(prob), ndigits))
+        for idx, prob in enumerate(belief)
+        if prob > threshold
+    )
 
 
 def best_qmdp_joint_action(
@@ -722,12 +785,19 @@ def make_belief_default_action_fn(
     fallback: int,
     mode: str = "qmdp-joint",
 ):
-    cache: Dict[Tuple[float, ...], int] = {}
+    cache: Dict[Tuple[Tuple[int, float], ...], int] = {}
+    obj_cache: Dict[int, Tuple[Sequence[float], int]] = {}
 
     def default_action(belief: Sequence[float]) -> int:
         if remaining_horizon <= 0:
             return fallback
-        key = tuple(round(float(x), 12) for x in belief)
+
+        obj_id = id(belief)
+        cached_obj = obj_cache.get(obj_id)
+        if cached_obj is not None and cached_obj[0] is belief:
+            return cached_obj[1]
+
+        key = sparse_rounded_belief_key(belief)
         if key not in cache:
             if mode == "qmdp-local-rank":
                 ranked = ranked_qmdp_local_actions(
@@ -741,7 +811,9 @@ def make_belief_default_action_fn(
                 cache[key] = ranked[0] if ranked else fallback
             else:
                 cache[key] = qmdp_local_action(belief, rid, model, remaining_horizon)
-        return cache[key]
+        action = cache[key]
+        obj_cache[obj_id] = (belief, action)
+        return action
 
     return default_action
 
@@ -924,6 +996,11 @@ def run_belief_obs_planning_step(
                 default_action_fn=defaults[rid],
                 default_action_fns_by_robot=defaults,
                 share_belief_nodes=args.belief_share_nodes,
+                belief_key_fn=(
+                    sparse_rounded_belief_key
+                    if args.belief_key == "sparse"
+                    else belief_core.rounded_belief_key
+                ),
                 gamma=args.gamma,
                 cp=args.cp,
                 horizon=remaining_horizon,
@@ -1235,47 +1312,53 @@ def run_table(args) -> None:
 def run_fullsim(args) -> None:
     model = LabyrinthModel(args.benchmark, args.mode)
     profiler = ProfileStats() if args.profile else None
+    obs_core.set_profiler(profiler)
+    belief_core.set_profiler(profiler)
     total_t0 = time.perf_counter()
-    print("Labyrinth stratified target evaluation")
-    print(
-        f"benchmark={args.benchmark} bid={model.bid}, horizon={args.horizon}, "
-        f"targets={model.targets}, trials_per_target={args.trials_per_target}"
-    )
-
-    target_means: List[float] = []
-    target_times: List[float] = []
-    for target_idx, target_node in enumerate(model.targets):
-        rewards = []
-        t0 = time.time()
-        for trial in range(args.trials_per_target):
-            rewards.append(
-                simulate_online_episode(
-                    model,
-                    args,
-                    episode_seed=args.seed + 104729 * target_idx + 7919 * trial,
-                    fixed_target_idx=target_idx,
-                    verbose=args.verbose_first and target_idx == 0 and trial == 0,
-                    profiler=profiler,
-                )
-            )
-        elapsed = time.time() - t0
-        mean, ci = confidence_interval_95(rewards)
-        target_means.append(mean)
-        target_times.append(elapsed)
+    try:
+        print("Labyrinth stratified target evaluation")
         print(
-            f"target={target_node:2d}: mean={mean:8.3f} ± {ci:.3f} "
-            f"time={elapsed:.2f}s",
-            flush=True,
+            f"benchmark={args.benchmark} bid={model.bid}, horizon={args.horizon}, "
+            f"targets={model.targets}, trials_per_target={args.trials_per_target}"
         )
 
-    mean, ci = confidence_interval_95(target_means)
-    print()
-    print(
-        f"Stratified mean return: {mean:.5f} ± {ci:.5f} "
-        f"(between-target 95% CI), total_time={sum(target_times):.2f}s"
-    )
-    if profiler is not None:
-        profiler.print_summary(total_time=time.perf_counter() - total_t0)
+        target_means: List[float] = []
+        target_times: List[float] = []
+        for target_idx, target_node in enumerate(model.targets):
+            rewards = []
+            t0 = time.time()
+            for trial in range(args.trials_per_target):
+                rewards.append(
+                    simulate_online_episode(
+                        model,
+                        args,
+                        episode_seed=args.seed + 104729 * target_idx + 7919 * trial,
+                        fixed_target_idx=target_idx,
+                        verbose=args.verbose_first and target_idx == 0 and trial == 0,
+                        profiler=profiler,
+                    )
+                )
+            elapsed = time.time() - t0
+            mean, ci = confidence_interval_95(rewards)
+            target_means.append(mean)
+            target_times.append(elapsed)
+            print(
+                f"target={target_node:2d}: mean={mean:8.3f} ± {ci:.3f} "
+                f"time={elapsed:.2f}s",
+                flush=True,
+            )
+
+        mean, ci = confidence_interval_95(target_means)
+        print()
+        print(
+            f"Stratified mean return: {mean:.5f} ± {ci:.5f} "
+            f"(between-target 95% CI), total_time={sum(target_times):.2f}s"
+        )
+        if profiler is not None:
+            profiler.print_summary(total_time=time.perf_counter() - total_t0)
+    finally:
+        obs_core.set_profiler(None)
+        belief_core.set_profiler(None)
 
 
 def main() -> None:
@@ -1320,6 +1403,12 @@ def main() -> None:
     parser.add_argument("--position-action-mask", action="store_true", default=False)
     parser.add_argument("--no-position-action-mask", dest="position_action_mask", action="store_false")
     parser.add_argument("--belief-share-nodes", action="store_true")
+    parser.add_argument(
+        "--belief-key",
+        choices=["sparse", "dense"],
+        default="sparse",
+        help="Belief key representation for belief-obs planner.",
+    )
     parser.add_argument("--heuristic-expansion", action="store_true", default=True)
     parser.add_argument("--random-expansion", dest="heuristic_expansion", action="store_false")
     parser.add_argument(

@@ -988,6 +988,7 @@ from __future__ import annotations
 import copy
 import math
 import random
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Hashable, List, Optional, Sequence, Tuple
 
@@ -1003,6 +1004,30 @@ History = Tuple[Tuple[Action, Observation], ...]
 # A partial policy tree maps local histories to actions.
 PolicyKey = Tuple[Tuple[History, Action], ...]
 JointPolicies = Dict[RobotID, "PolicyTree"]
+
+_PROFILER: Any = None
+
+
+def set_profiler(profiler: Any) -> None:
+    """Register an optional profiler with add(name, elapsed, count=1)."""
+    global _PROFILER
+    _PROFILER = profiler
+
+
+def _profiled_method(label: str, fn: Callable) -> Callable:
+    def wrapped(self, *args, **kwargs):
+        profiler = _PROFILER
+        if profiler is None:
+            return fn(self, *args, **kwargs)
+        t0 = time.perf_counter()
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            profiler.add(label, time.perf_counter() - t0)
+
+    wrapped.__name__ = getattr(fn, "__name__", "wrapped")
+    wrapped.__doc__ = getattr(fn, "__doc__", None)
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -2238,3 +2263,56 @@ class ObsDecMCTSTeam:
             )
 
         return out
+
+
+def _install_core_profiling_wrappers() -> None:
+    planner_methods = [
+        "iterate",
+        "best_policy",
+        "best_policy_by_value",
+        "best_action",
+        "_find_node_for_history",
+        "_policy_from_forced_root_action",
+        "_grow_tree_once",
+        "_simulate_from_node",
+        "_select_or_expand_action",
+        "_rollout",
+        "_score_policy_key",
+        "_update_sample_space",
+        "_update_distribution",
+        "_estimate_expectation",
+        "_eval_joint_policies",
+        "_sample_own_policy",
+        "_sample_other_policies",
+        "_sample_from_dist",
+        "_greedy_policy_from_tree",
+        "_fill_greedy_policy",
+        "_collect_nodes",
+        "_collect_edges",
+    ]
+    for name in planner_methods:
+        fn = getattr(ObsDecMCTS, name, None)
+        if fn is not None:
+            setattr(
+                ObsDecMCTS,
+                name,
+                _profiled_method(f"obs_core.ObsDecMCTS.{name}", fn),
+            )
+
+    team_methods = [
+        "iterate_and_communicate",
+        "best_policies",
+        "best_actions",
+        "entropies",
+    ]
+    for name in team_methods:
+        fn = getattr(ObsDecMCTSTeam, name, None)
+        if fn is not None:
+            setattr(
+                ObsDecMCTSTeam,
+                name,
+                _profiled_method(f"obs_core.ObsDecMCTSTeam.{name}", fn),
+            )
+
+
+_install_core_profiling_wrappers()
